@@ -3,8 +3,8 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   BackHandler,
-  Pressable,
   Linking,
+  Pressable,
   StyleSheet,
   Text,
   View,
@@ -14,25 +14,35 @@ import { WebView } from 'react-native-webview';
 import type {
   ShouldStartLoadRequest,
   WebViewErrorEvent,
+  WebViewHttpErrorEvent,
   WebViewNavigation,
 } from 'react-native-webview/lib/WebViewTypes';
 
 const APP_URL = 'https://app.healz.ai';
 const INTERNAL_HOSTS = new Set(['app.healz.ai', 'healz.ai', 'www.healz.ai']);
+const MOBILE_CHROME_USER_AGENT =
+  'Mozilla/5.0 (Linux; Android 15; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36';
 
 function isInternalUrl(url: string) {
   try {
     const parsed = new URL(url);
-    return INTERNAL_HOSTS.has(parsed.hostname);
+    return parsed.protocol.startsWith('http') && INTERNAL_HOSTS.has(parsed.hostname);
   } catch {
     return false;
   }
 }
 
+function isSystemUrl(url: string) {
+  return /^(mailto:|tel:|sms:|maps:|geo:)/i.test(url);
+}
+
+function isHttpUrl(url: string) {
+  return /^https?:/i.test(url);
+}
+
 export default function App() {
   const webViewRef = useRef<WebView>(null);
   const [canGoBack, setCanGoBack] = useState(false);
-  const [currentUrl, setCurrentUrl] = useState(APP_URL);
   const [loadError, setLoadError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -63,7 +73,6 @@ export default function App() {
 
   const handleNavigationStateChange = useCallback((state: WebViewNavigation) => {
     setCanGoBack(state.canGoBack);
-    setCurrentUrl(state.url);
   }, []);
 
   const handleShouldStartLoad = useCallback(
@@ -82,8 +91,18 @@ export default function App() {
         return true;
       }
 
+      if (isSystemUrl(url)) {
+        openExternalUrl(url);
+        return false;
+      }
+
       if (isInternalUrl(url)) {
         return true;
+      }
+
+      if (!isHttpUrl(url)) {
+        openExternalUrl(url);
+        return false;
       }
 
       openExternalUrl(url);
@@ -103,14 +122,19 @@ export default function App() {
     setLoadError(`${description || fallbackText}\n${url || APP_URL}`);
   }, []);
 
+  const handleHttpError = useCallback((event: WebViewHttpErrorEvent) => {
+    const { statusCode, description, url } = event.nativeEvent;
+    setLoadError(`HTTP ${statusCode}: ${description || 'Request failed'}\n${url || APP_URL}`);
+  }, []);
+
   const handleRetry = useCallback(() => {
     setLoadError(null);
     webViewRef.current?.reload();
   }, []);
 
   const handleOpenInBrowser = useCallback(() => {
-    openExternalUrl(currentUrl || APP_URL);
-  }, [currentUrl, openExternalUrl]);
+    openExternalUrl(APP_URL);
+  }, [openExternalUrl]);
 
   const renderLoading = useCallback(
     () => (
@@ -145,12 +169,16 @@ export default function App() {
       onNavigationStateChange={handleNavigationStateChange}
       onShouldStartLoadWithRequest={handleShouldStartLoad}
       onError={handleLoadError}
+      onHttpError={handleHttpError}
       javaScriptEnabled
       domStorageEnabled
       cacheEnabled
       sharedCookiesEnabled
       thirdPartyCookiesEnabled
       allowsBackForwardNavigationGestures
+      scalesPageToFit={false}
+      originWhitelist={['http://*', 'https://*', 'mailto:*', 'tel:*', 'sms:*']}
+      userAgent={MOBILE_CHROME_USER_AGENT}
       setSupportMultipleWindows={false}
       startInLoadingState
       renderLoading={renderLoading}
@@ -171,27 +199,27 @@ export default function App() {
 const styles = StyleSheet.create({
   safeArea: {
     flex: 1,
-    backgroundColor: '#f5f1e8',
+    backgroundColor: '#ffffff',
   },
   container: {
     flex: 1,
-    backgroundColor: '#f5f1e8',
+    backgroundColor: '#ffffff',
   },
   webview: {
     flex: 1,
-    backgroundColor: '#f5f1e8',
+    backgroundColor: '#ffffff',
   },
   loader: {
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: '#f5f1e8',
+    backgroundColor: '#ffffff',
   },
   errorCard: {
     flex: 1,
     justifyContent: 'center',
     paddingHorizontal: 24,
-    backgroundColor: '#f5f1e8',
+    backgroundColor: '#ffffff',
     gap: 14,
   },
   errorTitle: {
@@ -213,7 +241,7 @@ const styles = StyleSheet.create({
     paddingVertical: 14,
   },
   primaryButtonText: {
-    color: '#f5f1e8',
+    color: '#ffffff',
     fontSize: 16,
     fontWeight: '600',
   },
@@ -222,7 +250,8 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     borderRadius: 14,
     borderWidth: 1,
-    borderColor: '#122033',
+    borderColor: '#d5dce5',
+    backgroundColor: '#ffffff',
     paddingVertical: 14,
   },
   secondaryButtonText: {

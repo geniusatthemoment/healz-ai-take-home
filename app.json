@@ -11,9 +11,9 @@
       [
         "expo-splash-screen",
         {
-          "backgroundColor": "#F5F1E8",
+          "backgroundColor": "#FFF9FB",
           "image": "./assets/splash-icon.png",
-          "imageWidth": 220,
+          "imageWidth": 190,
           "resizeMode": "contain"
         }
       ]
@@ -24,9 +24,8 @@
     "android": {
       "package": "ai.healz.mobile",
       "adaptiveIcon": {
-        "backgroundColor": "#F5F1E8",
+        "backgroundColor": "#FFF9FB",
         "foregroundImage": "./assets/android-icon-foreground.png",
-        "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"
       },
       "predictiveBackGestureEnabled": false
