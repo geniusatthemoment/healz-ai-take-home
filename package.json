@@ -4,9 +4,13 @@
   "main": "index.ts",
   "dependencies": {
     "expo": "~57.0.9",
+    "expo-linking": "~57.0.4",
+    "expo-splash-screen": "~57.0.5",
     "expo-status-bar": "~57.0.1",
     "react": "19.2.3",
-    "react-native": "0.86.2"
+    "react-native": "0.86.2",
+    "react-native-safe-area-context": "~5.7.0",
+    "react-native-webview": "13.16.1"
   },
   "devDependencies": {
     "@types/react": "~19.2.2",
