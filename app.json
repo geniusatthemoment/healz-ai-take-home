@@ -8,6 +8,7 @@
     "userInterfaceStyle": "light",
     "scheme": "healz",
     "plugins": [
+      "./plugins/withAndroidShareTarget",
       [
         "expo-splash-screen",
         {
