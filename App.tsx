@@ -43,26 +43,23 @@ const WEBVIEW_LAYOUT_FIX = `
         // adds its own 52px inset for a full-screen browser, which would
         // otherwise push the menu and new-chat controls too far down.
         '.app-navbar { padding-top: 0 !important; }',
-        '.app-navbar > div { padding-top: 0 !important; }'
+        '.app-navbar > div { padding-top: 0 !important; }',
+        // Android WebView can retain stale tiles for animated blur layers
+        // while a long page is scrolled. Keep layout and fixed composer
+        // behavior, but remove effects that are purely decorative.
+        '*, *::before, *::after { animation: none !important; transition: none !important; }',
+        '[class*="backdrop-blur"] { backdrop-filter: none !important; -webkit-backdrop-filter: none !important; }',
+        '[style*="will-change"], [class*="will-change"] { will-change: auto !important; }',
+        // The testimonials use flex-1 inside clipped cards. On Android this
+        // can retain a stale grid height after hydration and place the next
+        // card over the previous one.
+        '.bg-surface-subtle { height: auto !important; min-height: 0 !important; contain: layout paint; }',
+        '.bg-surface-subtle > .flex-1 { flex: none !important; }'
       ].join('\\n');
       (document.head || document.documentElement).appendChild(style);
     }
 
     var fixSidebarTop = function () {
-      document.querySelectorAll('body *').forEach(function (node) {
-        var rect = node.getBoundingClientRect();
-        var computed = getComputedStyle(node);
-        if (
-          rect.top >= 0 &&
-          rect.top < 20 &&
-          rect.height > 60 &&
-          rect.height < 120 &&
-          computed.paddingTop === '52px'
-        ) {
-          node.style.paddingTop = '0px';
-        }
-      });
-
       document.querySelectorAll('img[alt="Healz"]').forEach(function (logo) {
         var logoRect = logo.getBoundingClientRect();
         var centeredContainer = logo.closest('[class*="justify-center"]');
@@ -96,16 +93,6 @@ const WEBVIEW_LAYOUT_FIX = `
       fixSidebarTop();
     };
 
-    var scheduledFix = false;
-    var scheduleFix = function () {
-      if (scheduledFix) return;
-      scheduledFix = true;
-      requestAnimationFrame(function () {
-        scheduledFix = false;
-        fixSidebarTop();
-      });
-    };
-
     forceLayout();
     window.addEventListener('load', forceLayout, { once: true });
     if (document.fonts && document.fonts.ready) {
@@ -113,16 +100,6 @@ const WEBVIEW_LAYOUT_FIX = `
     }
     setTimeout(forceLayout, 250);
     setTimeout(forceLayout, 900);
-    if (document.body) {
-      var observer = new MutationObserver(scheduleFix);
-      observer.observe(document.body, {
-        childList: true,
-        subtree: true
-      });
-      // The site hydrates its layout during the first seconds. After that,
-      // observing every DOM update only adds scroll and typing overhead.
-      setTimeout(function () { observer.disconnect(); }, 2500);
-    }
   })();
   true;
 `;
@@ -536,6 +513,10 @@ export default function App() {
       onMessage={handleWebMessage}
       onLoadEnd={handleLoadEnd}
       injectedJavaScript={WEBVIEW_LAYOUT_FIX}
+      // Software compositing avoids stale tiles from distant sections on
+      // Android WebView. Expensive DOM observers and visual effects above
+      // are disabled so this fallback does not compound the cost.
+      androidLayerType="software"
       javaScriptEnabled
       domStorageEnabled
       cacheEnabled
