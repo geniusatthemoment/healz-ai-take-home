@@ -28,16 +28,128 @@ const INTERNAL_HOSTS = new Set(['app.healz.ai', 'healz.ai', 'www.healz.ai']);
 const MOBILE_CHROME_USER_AGENT =
   'Mozilla/5.0 (Linux; Android 15; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36';
 
+// Android WebView can paint the landing page before web fonts and hydrated
+// sections have finished measuring. A focus event then fixes it by accident;
+// run the same layout pass explicitly after the page settles.
+const WEBVIEW_LAYOUT_FIX = `
+  (function healzWebViewLayoutFix() {
+    var styleId = 'healz-native-webview-fixes';
+    var style = document.getElementById(styleId);
+    if (!style) {
+      style = document.createElement('style');
+      style.id = styleId;
+      style.textContent = [
+        // SafeAreaView already consumes the native top inset. The chat page
+        // adds its own 52px inset for a full-screen browser, which would
+        // otherwise push the menu and new-chat controls too far down.
+        '.app-navbar { padding-top: 0 !important; }',
+        '.app-navbar > div { padding-top: 0 !important; }'
+      ].join('\\n');
+      (document.head || document.documentElement).appendChild(style);
+    }
+
+    var fixSidebarTop = function () {
+      document.querySelectorAll('body *').forEach(function (node) {
+        var rect = node.getBoundingClientRect();
+        var computed = getComputedStyle(node);
+        if (
+          rect.top >= 0 &&
+          rect.top < 20 &&
+          rect.height > 60 &&
+          rect.height < 120 &&
+          computed.paddingTop === '52px'
+        ) {
+          node.style.paddingTop = '0px';
+        }
+      });
+
+      document.querySelectorAll('img[alt="Healz"]').forEach(function (logo) {
+        var logoRect = logo.getBoundingClientRect();
+        var centeredContainer = logo.closest('[class*="justify-center"]');
+        if (logoRect.top > 100 && centeredContainer) {
+          centeredContainer.style.justifyContent = 'flex-start';
+          centeredContainer.style.paddingTop = '0px';
+          centeredContainer.style.marginTop = '-32px';
+
+          var sidebarLanguage = Array.prototype.slice
+            .call(document.querySelectorAll('button[aria-label="Language"]'))
+            .find(function (button) {
+              return button.getBoundingClientRect().width > 0;
+            });
+          for (var sidebarNode = sidebarLanguage?.parentElement; sidebarNode; sidebarNode = sidebarNode.parentElement) {
+            if (String(sidebarNode.className).includes('mt-[8px]')) {
+              sidebarNode.style.paddingTop = '0px';
+              break;
+            }
+          }
+        }
+      });
+    };
+
+    var forceLayout = function () {
+      var root = document.documentElement;
+      var body = document.body;
+      if (!root || !body) return;
+
+      root.style.overflowX = 'hidden';
+      body.style.overflowX = 'hidden';
+      fixSidebarTop();
+    };
+
+    var scheduledFix = false;
+    var scheduleFix = function () {
+      if (scheduledFix) return;
+      scheduledFix = true;
+      requestAnimationFrame(function () {
+        scheduledFix = false;
+        fixSidebarTop();
+      });
+    };
+
+    forceLayout();
+    window.addEventListener('load', forceLayout, { once: true });
+    if (document.fonts && document.fonts.ready) {
+      document.fonts.ready.then(forceLayout).catch(function () {});
+    }
+    setTimeout(forceLayout, 250);
+    setTimeout(forceLayout, 900);
+    if (document.body) {
+      var observer = new MutationObserver(scheduleFix);
+      observer.observe(document.body, {
+        childList: true,
+        subtree: true
+      });
+      // The site hydrates its layout during the first seconds. After that,
+      // observing every DOM update only adds scroll and typing overhead.
+      setTimeout(function () { observer.disconnect(); }, 2500);
+    }
+  })();
+  true;
+`;
+
 type SharedDocument = {
   uri: string;
   name: string;
   type: string;
   size: number;
+  originalSize: number;
+  compressed: boolean;
+  compressionRatio: number;
   base64: string;
 };
 
+type SharedDocumentBatch = {
+  documents: SharedDocument[];
+  count: number;
+  size: number;
+  originalSize: number;
+  compressedCount: number;
+  compressed: boolean;
+  compressionRatio: number;
+};
+
 type SharedDocumentModule = {
-  getPendingShare: () => Promise<SharedDocument | null>;
+  getPendingShare: () => Promise<SharedDocumentBatch | null>;
   clearPendingShare: () => void;
 };
 
@@ -66,12 +178,13 @@ function isHttpUrl(url: string) {
   return /^https?:/i.test(url);
 }
 
-function createAttachSharedDocumentInjection(document: SharedDocument) {
-  const payload = JSON.stringify(document);
+function createAttachSharedDocumentInjection(batch: SharedDocumentBatch) {
+  const payload = JSON.stringify(batch);
 
   return `
     (function attachSharedDocument() {
-      var sharedDocument = ${payload};
+      var sharedBatch = ${payload};
+      var sharedDocuments = sharedBatch.documents || [];
 
       var report = function (status, message) {
         window.ReactNativeWebView.postMessage(JSON.stringify({
@@ -117,17 +230,31 @@ function createAttachSharedDocumentInjection(document: SharedDocument) {
       };
 
       var attachToInput = function (input) {
-        var file = new File(
-          [base64ToBytes(sharedDocument.base64)],
-          sharedDocument.name,
-          { type: sharedDocument.type }
-        );
+        if (sharedDocuments.length === 0) {
+          report('error', 'No shared documents were received from Android.');
+          return;
+        }
+
         var transfer = new DataTransfer();
-        transfer.items.add(file);
+
+        sharedDocuments.forEach(function (sharedDocument) {
+          var file = new File(
+            [base64ToBytes(sharedDocument.base64)],
+            sharedDocument.name,
+            { type: sharedDocument.type }
+          );
+          transfer.items.add(file);
+        });
+
         input.files = transfer.files;
         input.dispatchEvent(new Event('input', { bubbles: true }));
         input.dispatchEvent(new Event('change', { bubbles: true }));
-        report('attached', 'Shared file was passed to Healz.');
+        report(
+          'attached',
+          sharedDocuments.length === 1
+            ? 'Shared file was passed to Healz.'
+            : sharedDocuments.length + ' shared files were passed to Healz.'
+        );
       };
 
       var tryAttach = function () {
@@ -171,10 +298,11 @@ function createAttachSharedDocumentInjection(document: SharedDocument) {
 
 export default function App() {
   const webViewRef = useRef<WebView>(null);
-  const pendingSharedDocumentRef = useRef<SharedDocument | null>(null);
+  const pendingSharedDocumentRef = useRef<SharedDocumentBatch | null>(null);
+  const isReadingShareRef = useRef(false);
   const [canGoBack, setCanGoBack] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [pendingSharedDocument, setPendingSharedDocument] = useState<SharedDocument | null>(null);
+  const [pendingSharedDocument, setPendingSharedDocument] = useState<SharedDocumentBatch | null>(null);
   const [isWebViewReady, setIsWebViewReady] = useState(false);
   const [shareStatus, setShareStatus] = useState<string | null>(null);
 
@@ -279,22 +407,36 @@ export default function App() {
   }, [openExternalUrl]);
 
   const checkPendingShare = useCallback(async () => {
-    if (Platform.OS !== 'android' || !sharedDocumentModule || pendingSharedDocumentRef.current) {
+    if (
+      Platform.OS !== 'android' ||
+      !sharedDocumentModule ||
+      pendingSharedDocumentRef.current ||
+      isReadingShareRef.current
+    ) {
       return;
     }
 
+    isReadingShareRef.current = true;
+
     try {
-      const document = await sharedDocumentModule.getPendingShare();
-      if (!document) {
+      const batch = await sharedDocumentModule.getPendingShare();
+      if (!batch || batch.documents.length === 0) {
         return;
       }
 
-      setPendingSharedDocument(document);
-      setShareStatus(`Preparing ${document.name} for Healz...`);
+      setPendingSharedDocument(batch);
+      sharedDocumentModule.clearPendingShare();
+      const fileLabel = batch.count === 1 ? batch.documents[0].name : `${batch.count} documents`;
+      const status = batch.compressed
+        ? `Optimized ${fileLabel} for readability and upload speed...`
+        : `Preparing ${fileLabel} for Healz...`;
+      setShareStatus(status);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Could not read shared document.';
       Alert.alert('Could not import shared document', message);
       sharedDocumentModule.clearPendingShare();
+    } finally {
+      isReadingShareRef.current = false;
     }
   }, []);
 
@@ -319,7 +461,11 @@ export default function App() {
       return;
     }
 
-    setShareStatus(`Attaching ${pendingSharedDocument.name} in Healz...`);
+    const fileLabel =
+      pendingSharedDocument.count === 1
+        ? pendingSharedDocument.documents[0].name
+        : `${pendingSharedDocument.count} documents`;
+    setShareStatus(`Attaching ${fileLabel} in Healz...`);
     webViewRef.current?.injectJavaScript(
       createAttachSharedDocumentInjection(pendingSharedDocument)
     );
@@ -389,6 +535,7 @@ export default function App() {
       onHttpError={handleHttpError}
       onMessage={handleWebMessage}
       onLoadEnd={handleLoadEnd}
+      injectedJavaScript={WEBVIEW_LAYOUT_FIX}
       javaScriptEnabled
       domStorageEnabled
       cacheEnabled
