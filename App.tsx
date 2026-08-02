@@ -155,6 +155,15 @@ function isHttpUrl(url: string) {
   return /^https?:/i.test(url);
 }
 
+function resolveHealzDeepLink(url: string | null | undefined) {
+  if (!url || !url.toLowerCase().startsWith('healz://')) {
+    return null;
+  }
+
+  const route = url.slice('healz://'.length);
+  return `${APP_URL}/${route}`;
+}
+
 function createAttachSharedDocumentInjection(batch: SharedDocumentBatch) {
   const payload = JSON.stringify(batch);
 
@@ -226,6 +235,7 @@ function createAttachSharedDocumentInjection(batch: SharedDocumentBatch) {
         input.files = transfer.files;
         input.dispatchEvent(new Event('input', { bubbles: true }));
         input.dispatchEvent(new Event('change', { bubbles: true }));
+        window.__healzShareAttachRequested = false;
         report(
           'attached',
           sharedDocuments.length === 1
@@ -243,7 +253,13 @@ function createAttachSharedDocumentInjection(batch: SharedDocumentBatch) {
 
         var attachButton = findAttachControl();
         if (attachButton) {
-          attachButton.click();
+          // A share can arrive before the chat has mounted its file input.
+          // Open the picker once, then let the native shell retry without
+          // repeatedly opening the system picker on every attempt.
+          if (!window.__healzShareAttachRequested) {
+            window.__healzShareAttachRequested = true;
+            attachButton.click();
+          }
           setTimeout(function () {
             var nextInput = findFileInput();
             if (nextInput) {
@@ -251,6 +267,7 @@ function createAttachSharedDocumentInjection(batch: SharedDocumentBatch) {
               return;
             }
 
+            window.__healzShareAttachRequested = false;
             report(
               'waiting',
               'Finish login in Healz. The shared document will attach after the chat is ready.'
@@ -259,7 +276,7 @@ function createAttachSharedDocumentInjection(batch: SharedDocumentBatch) {
           return;
         }
 
-        report('error', 'Open a Healz chat first, then share the document again.');
+        report('waiting', 'Open a Healz chat. The shared document will attach automatically.');
       };
 
       try {
@@ -277,11 +294,48 @@ export default function App() {
   const webViewRef = useRef<WebView>(null);
   const pendingSharedDocumentRef = useRef<SharedDocumentBatch | null>(null);
   const isReadingShareRef = useRef(false);
+  const shareRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [canGoBack, setCanGoBack] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [pendingSharedDocument, setPendingSharedDocument] = useState<SharedDocumentBatch | null>(null);
   const [isWebViewReady, setIsWebViewReady] = useState(false);
   const [shareStatus, setShareStatus] = useState<string | null>(null);
+  const [shareRetryNonce, setShareRetryNonce] = useState(0);
+  const [webViewUrl, setWebViewUrl] = useState(APP_URL);
+
+  const navigateToDeepLink = useCallback((url: string | null | undefined) => {
+    const targetUrl = resolveHealzDeepLink(url);
+    if (!targetUrl) {
+      return false;
+    }
+
+    setLoadError(null);
+    setWebViewUrl(targetUrl);
+    return true;
+  }, []);
+
+  useEffect(() => {
+    let mounted = true;
+
+    Linking.getInitialURL()
+      .then((url) => {
+        if (mounted) {
+          navigateToDeepLink(url);
+        }
+      })
+      .catch((error) => {
+        console.warn('Unable to read initial deep link', error);
+      });
+
+    const deepLinkSubscription = Linking.addEventListener('url', ({ url }) => {
+      navigateToDeepLink(url);
+    });
+
+    return () => {
+      mounted = false;
+      deepLinkSubscription.remove();
+    };
+  }, [navigateToDeepLink]);
 
   useEffect(() => {
     const backSubscription = BackHandler.addEventListener(
@@ -310,6 +364,7 @@ export default function App() {
       await Linking.openURL(url);
     } catch (error) {
       console.warn('Unable to open external URL', error);
+      Alert.alert('Could not open link', 'No compatible app is available for this link.');
     }
   }, []);
 
@@ -402,7 +457,6 @@ export default function App() {
       }
 
       setPendingSharedDocument(batch);
-      sharedDocumentModule.clearPendingShare();
       const fileLabel = batch.count === 1 ? batch.documents[0].name : `${batch.count} documents`;
       const status = batch.compressed
         ? `Optimized ${fileLabel} for readability and upload speed...`
@@ -430,6 +484,10 @@ export default function App() {
     return () => {
       clearInterval(interval);
       subscription.remove();
+      if (shareRetryTimerRef.current) {
+        clearTimeout(shareRetryTimerRef.current);
+        shareRetryTimerRef.current = null;
+      }
     };
   }, [checkPendingShare]);
 
@@ -446,7 +504,7 @@ export default function App() {
     webViewRef.current?.injectJavaScript(
       createAttachSharedDocumentInjection(pendingSharedDocument)
     );
-  }, [isWebViewReady, pendingSharedDocument]);
+  }, [isWebViewReady, pendingSharedDocument, shareRetryNonce]);
 
   const handleWebMessage = useCallback(
     (event: WebViewMessageEvent) => {
@@ -458,8 +516,20 @@ export default function App() {
 
         if (message.status === 'waiting') {
           setShareStatus(message.message);
-          sharedDocumentModule?.clearPendingShare();
+          if (!shareRetryTimerRef.current) {
+            shareRetryTimerRef.current = setTimeout(() => {
+              shareRetryTimerRef.current = null;
+              if (pendingSharedDocumentRef.current) {
+                setShareRetryNonce((current) => current + 1);
+              }
+            }, 1200);
+          }
           return;
+        }
+
+        if (shareRetryTimerRef.current) {
+          clearTimeout(shareRetryTimerRef.current);
+          shareRetryTimerRef.current = null;
         }
 
         setPendingSharedDocument(null);
@@ -503,7 +573,7 @@ export default function App() {
   const webView = (
     <WebView
       ref={webViewRef}
-      source={{ uri: APP_URL }}
+      source={{ uri: webViewUrl }}
       style={styles.webview}
       onLoadStart={handleLoadStart}
       onNavigationStateChange={handleNavigationStateChange}
@@ -522,6 +592,7 @@ export default function App() {
       cacheEnabled
       sharedCookiesEnabled
       thirdPartyCookiesEnabled
+      incognito={false}
       allowsBackForwardNavigationGestures
       scalesPageToFit={false}
       originWhitelist={['http://*', 'https://*', 'mailto:*', 'tel:*', 'sms:*']}

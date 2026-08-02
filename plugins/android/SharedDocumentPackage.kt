@@ -8,6 +8,8 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Matrix
+import android.media.ExifInterface
 import android.net.Uri
 import android.provider.OpenableColumns
 import android.util.Base64
@@ -21,11 +23,14 @@ import com.facebook.react.bridge.ReactContextBaseJavaModule
 import com.facebook.react.bridge.ReactMethod
 import com.facebook.react.bridge.WritableMap
 import com.facebook.react.uimanager.ViewManager
+import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import kotlin.math.max
 import kotlin.math.roundToInt
 
 private const val MAX_SHARED_FILE_BYTES = 12 * 1024 * 1024
+private const val MAX_SHARED_BATCH_FILES = 5
+private const val MAX_SHARED_BATCH_BYTES = 20 * 1024 * 1024
 private const val IMAGE_COMPRESSION_THRESHOLD_BYTES = 1536 * 1024
 private const val IMAGE_TARGET_BYTES = 2 * 1024 * 1024
 private const val IMAGE_MAX_LONG_SIDE = 2400
@@ -47,23 +52,48 @@ private data class SharedDocumentPayload(
 )
 
 object SharedDocumentStore {
+  private const val PREFS_NAME = "healz_shared_documents"
+  private const val PREF_ACTION = "action"
+  private const val PREF_TYPE = "type"
+  private const val PREF_URIS = "uris"
   private var pendingIntent: Intent? = null
 
-  fun capture(intent: Intent?) {
-    if (intent?.action == Intent.ACTION_SEND || intent?.action == Intent.ACTION_SEND_MULTIPLE) {
-      pendingIntent = Intent(intent)
+  fun capture(context: Context, intent: Intent?) {
+    if (intent?.action != Intent.ACTION_SEND && intent?.action != Intent.ACTION_SEND_MULTIPLE) {
+      return
     }
+
+    val uris = extractUris(intent)
+    if (uris.isEmpty()) {
+      return
+    }
+
+    pendingIntent = Intent(intent)
+    context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+      .edit()
+      .putString(PREF_ACTION, intent.action)
+      .putString(PREF_TYPE, intent.type)
+      .putStringSet(PREF_URIS, uris.map(Uri::toString).toSet())
+      .apply()
   }
 
-  fun clear() {
+  fun clear(context: Context) {
     pendingIntent = null
+    context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+      .edit()
+      .clear()
+      .apply()
   }
 
   fun readFirstSharedDocument(context: Context): WritableMap? {
-    val intent = pendingIntent ?: return null
+    val intent = pendingIntent ?: restoreIntent(context) ?: return null
     val uris = extractUris(intent)
     if (uris.isEmpty()) {
       return null
+    }
+
+    require(uris.size <= MAX_SHARED_BATCH_FILES) {
+      "You can share up to $MAX_SHARED_BATCH_FILES files at once."
     }
 
     Log.i("SharedDocument", "Received ${uris.size} shared URI(s).")
@@ -74,6 +104,9 @@ object SharedDocumentStore {
 
     uris.forEach { uri ->
       val document = readSharedDocument(context, intent, uri)
+      require(totalOriginalSize + document.originalSize.toLong() <= MAX_SHARED_BATCH_BYTES) {
+        "The shared files are larger than 20 MB in total. Please share fewer or smaller files."
+      }
       documents.pushMap(document.map)
       totalOriginalSize += document.originalSize.toLong()
       totalPreparedSize += document.preparedSize.toLong()
@@ -96,19 +129,39 @@ object SharedDocumentStore {
     }
   }
 
+  private fun restoreIntent(context: Context): Intent? {
+    val preferences = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    val action = preferences.getString(PREF_ACTION, null) ?: return null
+    val uris = preferences.getStringSet(PREF_URIS, emptySet())?.map(Uri::parse).orEmpty()
+    if (uris.isEmpty()) {
+      return null
+    }
+
+    return Intent(action).apply {
+      type = preferences.getString(PREF_TYPE, null)
+      if (action == Intent.ACTION_SEND) {
+        putExtra(Intent.EXTRA_STREAM, uris.first())
+      } else {
+        putParcelableArrayListExtra(Intent.EXTRA_STREAM, ArrayList(uris))
+      }
+    }.also { pendingIntent = it }
+  }
+
   private fun readSharedDocument(
     context: Context,
     intent: Intent,
     uri: Uri
   ): SharedDocumentPayload {
     val resolver = context.contentResolver
-    val mimeType = resolver.getType(uri) ?: intent.type ?: "application/octet-stream"
+    val declaredMimeType = resolver.getType(uri) ?: intent.type ?: "application/octet-stream"
+
+    val originalBytes = readBytes(resolver, uri)
+    val mimeType = detectMimeType(originalBytes, declaredMimeType)
 
     if (!mimeType.startsWith("image/") && mimeType != "application/pdf") {
       throw IllegalArgumentException("Only PDF and image files are supported.")
     }
 
-    val originalBytes = readBytes(resolver, uri)
     val metadata = readMetadata(resolver, uri)
     val originalName = metadata.first ?: uri.lastPathSegment ?: "healz-document"
     val prepared = prepareDocument(originalBytes, originalName, mimeType)
@@ -178,6 +231,17 @@ object SharedDocumentStore {
     name: String,
     mimeType: String
   ): PreparedDocument {
+    if (mimeType == "application/pdf") {
+      require(hasPdfSignature(bytes)) {
+        "This file is not a valid PDF document."
+      }
+
+      // PDFs are intentionally passed through byte-for-byte. Re-rendering a
+      // medical PDF can remove text layers, annotations, or embedded scans.
+      Log.i("SharedDocument", "Keeping PDF unchanged (${bytes.size} bytes).")
+      return PreparedDocument(bytes, name, mimeType, bytes.size, compressed = false)
+    }
+
     if (!mimeType.startsWith("image/") || bytes.size <= IMAGE_COMPRESSION_THRESHOLD_BYTES) {
       Log.i("SharedDocument", "Keeping original shared document (${bytes.size} bytes, type=$mimeType).")
       return PreparedDocument(bytes, name, mimeType, bytes.size, compressed = false)
@@ -219,9 +283,14 @@ object SharedDocumentStore {
       }
     ) ?: return null
 
-    val resized = resizeToLongSide(decoded, IMAGE_MAX_LONG_SIDE)
-    if (resized !== decoded) {
+    val oriented = applyExifOrientation(decoded, bytes)
+    if (oriented !== decoded) {
       decoded.recycle()
+    }
+
+    val resized = resizeToLongSide(oriented, IMAGE_MAX_LONG_SIDE)
+    if (resized !== oriented) {
+      oriented.recycle()
     }
 
     val flattened = flattenOnWhite(resized)
@@ -289,6 +358,61 @@ object SharedDocumentStore {
     return best
   }
 
+  private fun detectMimeType(bytes: ByteArray, declaredMimeType: String): String {
+    return when {
+      hasPdfSignature(bytes) -> "application/pdf"
+      hasBytes(bytes, byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte())) -> "image/jpeg"
+      hasBytes(bytes, byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A)) -> "image/png"
+      hasBytes(bytes, byteArrayOf(0x47, 0x49, 0x46, 0x38)) -> "image/gif"
+      bytes.size >= 12 && String(bytes, 0, 4, Charsets.US_ASCII) == "RIFF" &&
+        String(bytes, 8, 4, Charsets.US_ASCII) == "WEBP" -> "image/webp"
+      declaredMimeType.startsWith("image/") -> declaredMimeType
+      else -> declaredMimeType
+    }
+  }
+
+  private fun hasPdfSignature(bytes: ByteArray): Boolean {
+    return bytes.size >= 5 && String(bytes, 0, 5, Charsets.US_ASCII) == "%PDF-"
+  }
+
+  private fun hasBytes(bytes: ByteArray, signature: ByteArray): Boolean {
+    return bytes.size >= signature.size && bytes.copyOfRange(0, signature.size).contentEquals(signature)
+  }
+
+  private fun applyExifOrientation(bitmap: Bitmap, bytes: ByteArray): Bitmap {
+    val orientation = runCatching {
+      ExifInterface(ByteArrayInputStream(bytes)).getAttributeInt(
+        ExifInterface.TAG_ORIENTATION,
+        ExifInterface.ORIENTATION_NORMAL
+      )
+    }.getOrDefault(ExifInterface.ORIENTATION_NORMAL)
+
+    val matrix = Matrix()
+    when (orientation) {
+      ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.setScale(-1f, 1f)
+      ExifInterface.ORIENTATION_ROTATE_180 -> matrix.setRotate(180f)
+      ExifInterface.ORIENTATION_FLIP_VERTICAL -> matrix.setScale(1f, -1f)
+      ExifInterface.ORIENTATION_TRANSPOSE -> {
+        matrix.setRotate(90f)
+        matrix.postScale(-1f, 1f)
+      }
+      ExifInterface.ORIENTATION_ROTATE_90 -> matrix.setRotate(90f)
+      ExifInterface.ORIENTATION_TRANSVERSE -> {
+        matrix.setRotate(-90f)
+        matrix.postScale(-1f, 1f)
+      }
+      ExifInterface.ORIENTATION_ROTATE_270 -> matrix.setRotate(-90f)
+      else -> return bitmap
+    }
+
+    return runCatching {
+      Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+    }.getOrElse {
+      Log.w("SharedDocument", "Could not apply EXIF orientation; keeping decoded pixels.", it)
+      bitmap
+    }
+  }
+
   private fun replaceExtensionWithJpeg(name: String): String {
     val cleanName = name.substringAfterLast('/').ifBlank { "healz-document" }
     val baseName = cleanName.substringBeforeLast('.', cleanName)
@@ -330,7 +454,7 @@ class SharedDocumentModule(
 
   @ReactMethod
   fun clearPendingShare() {
-    SharedDocumentStore.clear()
+    SharedDocumentStore.clear(reactContext)
   }
 }
 

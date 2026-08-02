@@ -66,7 +66,7 @@ function updateMainActivity(projectRoot) {
   source = addOnce(
     source,
     'SharedDocumentStore.capture(intent)',
-    '    SharedDocumentStore.capture(intent)\n',
+    '    SharedDocumentStore.capture(this, intent)\n',
     '    super.onCreate(null)\n'
   );
 
@@ -76,7 +76,7 @@ function updateMainActivity(projectRoot) {
     `  override fun onNewIntent(intent: Intent) {
     super.onNewIntent(intent)
     setIntent(intent)
-    SharedDocumentStore.capture(intent)
+    SharedDocumentStore.capture(this, intent)
   }
 
 `,
