@@ -25,6 +25,10 @@ import com.facebook.react.bridge.WritableMap
 import com.facebook.react.uimanager.ViewManager
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.util.UUID
 import org.json.JSONArray
 import kotlin.math.max
 import kotlin.math.roundToInt
@@ -58,6 +62,7 @@ object SharedDocumentStore {
   private const val PREF_TYPE = "type"
   private const val PREF_URIS = "uris"
   private const val PREF_URIS_JSON = "uris_json"
+  private const val CACHE_DIRECTORY = "shared-documents"
   private var pendingIntent: Intent? = null
 
   fun capture(context: Context, intent: Intent?) {
@@ -70,17 +75,20 @@ object SharedDocumentStore {
       return
     }
 
-    pendingIntent = Intent(intent)
-    val uriArray = JSONArray()
-    uris.forEach { uri ->
-      // Some document providers only grant access for the lifetime of the
-      // activity. Keep a persistable grant when the provider supports it.
-      runCatching {
-        context.contentResolver.takePersistableUriPermission(
-          uri,
-          Intent.FLAG_GRANT_READ_URI_PERMISSION
-        )
+    // Google Photos and some mail clients give us a one-shot content URI. A
+    // restart can invalidate it before React Native asks for the file, so copy
+    // it into app-private cache while this Activity still has the grant.
+    val cachedUris = uris.map { uri -> cacheSharedUri(context, uri) }
+    val cachedIntent = Intent(intent).apply {
+      if (action == Intent.ACTION_SEND) {
+        putExtra(Intent.EXTRA_STREAM, cachedUris.first())
+      } else {
+        putParcelableArrayListExtra(Intent.EXTRA_STREAM, ArrayList(cachedUris))
       }
+    }
+    pendingIntent = cachedIntent
+    val uriArray = JSONArray()
+    cachedUris.forEach { uri ->
       uriArray.put(uri.toString())
     }
 
@@ -90,11 +98,14 @@ object SharedDocumentStore {
       // StringSet does not preserve order. JSON keeps multi-file shares
       // deterministic and remains readable after process death.
       .putString(PREF_URIS_JSON, uriArray.toString())
-      .apply()
+      // The first share may cold-start the process. Commit this tiny record
+      // before React Native initializes so the intent cannot be lost.
+      .commit()
   }
 
   fun clear(context: Context) {
     pendingIntent = null
+    sharedCacheDirectory(context).deleteRecursively()
     context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
       .edit()
       .clear()
@@ -154,10 +165,7 @@ object SharedDocumentStore {
         val array = JSONArray(savedJson)
         (0 until array.length()).map { Uri.parse(array.getString(it)) }
       }.getOrDefault(emptyList())
-    } else {
-      // Read old builds' preferences once for backwards compatibility.
-      preferences.getStringSet(PREF_URIS, emptySet())?.map(Uri::parse).orEmpty()
-    }
+    } else emptyList()
     if (uris.isEmpty()) {
       return null
     }
@@ -231,6 +239,14 @@ object SharedDocumentStore {
   }
 
   private fun readBytes(resolver: ContentResolver, uri: Uri): ByteArray {
+    if (uri.scheme == "file") {
+      val file = File(requireNotNull(uri.path) { "Shared file path is missing." })
+      require(file.exists()) { "The shared file is no longer available." }
+      require(file.length() <= MAX_SHARED_FILE_BYTES) {
+        "File is larger than 12 MB. Please choose a smaller file."
+      }
+      return FileInputStream(file).use { input -> readStream(input) }
+    }
     val declaredSize = runCatching {
       resolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)?.use { cursor ->
         if (cursor.moveToFirst() && !cursor.isNull(0)) cursor.getLong(0) else null
@@ -242,34 +258,69 @@ object SharedDocumentStore {
       }
     }
 
-    resolver.openInputStream(uri).use { input ->
+    return resolver.openInputStream(uri).use { input ->
       requireNotNull(input) { "Could not open shared file." }
-      val output = ByteArrayOutputStream()
-      val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-      var total = 0L
-      var emptyReads = 0
-
-      while (true) {
-        val read = input.read(buffer)
-        if (read == -1) break
-        if (read == 0) {
-          emptyReads += 1
-          if (emptyReads > 8) {
-            throw IllegalArgumentException("The file provider stopped returning data.")
-          }
-          continue
-        }
-        emptyReads = 0
-        total += read
-        if (total > MAX_SHARED_FILE_BYTES.toLong()) {
-          throw IllegalArgumentException("File is larger than 12 MB. Please choose a smaller file.")
-        }
-        output.write(buffer, 0, read)
-      }
-
-      return output.toByteArray()
+      readStream(input)
     }
   }
+
+  private fun readStream(input: java.io.InputStream): ByteArray {
+    val output = ByteArrayOutputStream()
+    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+    var total = 0L
+    var emptyReads = 0
+    while (true) {
+      val read = input.read(buffer)
+      if (read == -1) break
+      if (read == 0) {
+        emptyReads += 1
+        if (emptyReads > 8) throw IllegalArgumentException("The file provider stopped returning data.")
+        continue
+      }
+      emptyReads = 0
+      total += read
+      if (total > MAX_SHARED_FILE_BYTES.toLong()) {
+        throw IllegalArgumentException("File is larger than 12 MB. Please choose a smaller file.")
+      }
+      output.write(buffer, 0, read)
+    }
+    return output.toByteArray()
+  }
+
+  private fun cacheSharedUri(context: Context, uri: Uri): Uri {
+    val resolver = context.contentResolver
+    val originalName = readMetadata(resolver, uri).first ?: "healz-document"
+    val safeName = originalName.replace(Regex("[^A-Za-z0-9._-]"), "_").takeLast(96)
+      .ifBlank { "healz-document" }
+    val directory = sharedCacheDirectory(context).apply { mkdirs() }
+    val target = File(directory, "${UUID.randomUUID()}_$safeName")
+
+    try {
+      resolver.openInputStream(uri).use { input ->
+        requireNotNull(input) { "Could not open shared file." }
+        FileOutputStream(target).use { output ->
+          val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+          var total = 0L
+          while (true) {
+            val read = input.read(buffer)
+            if (read == -1) break
+            if (read == 0) continue
+            total += read
+            if (total > MAX_SHARED_FILE_BYTES.toLong()) {
+              throw IllegalArgumentException("File is larger than 12 MB. Please choose a smaller file.")
+            }
+            output.write(buffer, 0, read)
+          }
+        }
+      }
+      return Uri.fromFile(target)
+    } catch (error: Exception) {
+      target.delete()
+      throw error
+    }
+  }
+
+  private fun sharedCacheDirectory(context: Context): File = File(context.cacheDir, CACHE_DIRECTORY)
 
   private fun prepareDocument(
     bytes: ByteArray,
@@ -493,6 +544,10 @@ object SharedDocumentStore {
   }
 
   private fun readMetadata(resolver: ContentResolver, uri: Uri): Pair<String?, Long?> {
+    if (uri.scheme == "file") {
+      val file = File(requireNotNull(uri.path) { "Shared file path is missing." })
+      return Pair(file.name.substringAfter('_', file.name), file.length())
+    }
     var cursor: Cursor? = null
     return try {
       cursor = resolver.query(uri, null, null, null, null)

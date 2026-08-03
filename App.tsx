@@ -179,6 +179,9 @@ function createAttachSharedDocumentInjection(batch: SharedDocumentBatch) {
     (function attachSharedDocument() {
       var sharedBatch = ${payload};
       var sharedDocuments = sharedBatch.documents || [];
+      var batchKey = sharedDocuments.map(function (document) {
+        return [document.uri, document.name, document.size].join('|');
+      }).join('||');
 
       var report = function (status, message) {
         window.ReactNativeWebView.postMessage(JSON.stringify({
@@ -189,7 +192,28 @@ function createAttachSharedDocumentInjection(batch: SharedDocumentBatch) {
       };
 
       var findFileInput = function () {
-        return document.querySelector('input[type="file"]:not([disabled])');
+        var inputs = Array.prototype.slice.call(
+          document.querySelectorAll('input[type="file"]:not([disabled])')
+        ).filter(function (input) {
+          return input.isConnected && !input.closest('[aria-hidden="true"]');
+        });
+
+        // Healz can keep file inputs from inactive UI branches in the DOM.
+        // Prefer the one whose surrounding composer is actually on screen.
+        var score = function (input) {
+          var points = 0;
+          for (var node = input.parentElement, depth = 0; node && depth < 5; node = node.parentElement, depth += 1) {
+            var rect = node.getBoundingClientRect();
+            if (rect.width > 80 && rect.height > 20 && rect.bottom > 0 && rect.top < window.innerHeight) {
+              points += 10;
+            }
+          }
+          return points;
+        };
+
+        return inputs.sort(function (left, right) {
+          return score(right) - score(left);
+        })[0] || null;
       };
 
       var findAttachControl = function () {
@@ -223,9 +247,9 @@ function createAttachSharedDocumentInjection(batch: SharedDocumentBatch) {
         return bytes;
       };
 
-      var attachToInput = function (input) {
+      var attachToInput = function (input, finish) {
         if (sharedDocuments.length === 0) {
-          report('error', 'No shared documents were received from Android.');
+          finish('error', 'No shared documents were received from Android.');
           return;
         }
 
@@ -243,48 +267,74 @@ function createAttachSharedDocumentInjection(batch: SharedDocumentBatch) {
         input.files = transfer.files;
         input.dispatchEvent(new Event('input', { bubbles: true }));
         input.dispatchEvent(new Event('change', { bubbles: true }));
+      };
+
+      if (window.__healzShareActiveBatch === batchKey) {
+        report('waiting', 'Waiting for the Healz chat to finish loading.');
+        return true;
+      }
+      window.__healzShareActiveBatch = batchKey;
+
+      var startedAt = Date.now();
+      var deadlineMs = 12000;
+      var pickerOpened = false;
+      var completed = false;
+      var finish = function (status, message) {
+        if (completed) return;
+        completed = true;
+        window.__healzShareActiveBatch = null;
         window.__healzShareAttachRequested = false;
-        report(
-          'attached',
-          sharedDocuments.length === 1
-            ? 'Shared file was passed to Healz.'
-            : sharedDocuments.length + ' shared files were passed to Healz.'
-        );
+        report(status, message);
       };
 
       var tryAttach = function () {
+        if (completed) return;
         var input = findFileInput();
         if (input) {
-          attachToInput(input);
+          try {
+            attachToInput(input, finish);
+            // Dispatching a change is asynchronous from the site's point of
+            // view. Confirm that the active input retained all files before
+            // native code clears its durable pending-share record.
+            setTimeout(function () {
+              if (input.isConnected && input.files && input.files.length === sharedDocuments.length) {
+                finish(
+                  'attached',
+                  sharedDocuments.length === 1
+                    ? 'Shared file was passed to Healz.'
+                    : sharedDocuments.length + ' shared files were passed to Healz.'
+                );
+                return;
+              }
+              poll();
+            }, 0);
+          } catch (error) {
+            poll();
+          }
           return;
         }
 
-        var attachButton = findAttachControl();
-        if (attachButton) {
-          // A share can arrive before the chat has mounted its file input.
-          // Open the picker once, then let the native shell retry without
-          // repeatedly opening the system picker on every attempt.
+        // Let the chat hydrate first. Opening a file picker immediately after
+        // an Android share intent races with the incoming attachment.
+        if (Date.now() - startedAt >= 1800 && !pickerOpened) {
+          var attachButton = findAttachControl();
           if (!window.__healzShareAttachRequested) {
             window.__healzShareAttachRequested = true;
-            attachButton.click();
+            pickerOpened = true;
+            attachButton && attachButton.click();
           }
-          setTimeout(function () {
-            var nextInput = findFileInput();
-            if (nextInput) {
-              attachToInput(nextInput);
-              return;
-            }
-
-            window.__healzShareAttachRequested = false;
-            report(
-              'waiting',
-              'Finish login in Healz. The shared document will attach after the chat is ready.'
-            );
-          }, 500);
-          return;
         }
 
-        report('waiting', 'Open a Healz chat. The shared document will attach automatically.');
+        poll();
+      };
+
+      var poll = function () {
+        if (completed) return;
+        if (Date.now() - startedAt >= deadlineMs) {
+          finish('waiting', 'Open a Healz chat. The shared document will attach automatically.');
+          return;
+        }
+        setTimeout(tryAttach, 250);
       };
 
       try {
@@ -422,7 +472,6 @@ export default function App() {
 
   const handleLoadStart = useCallback(() => {
     setLoadError(null);
-    setIsWebViewReady(false);
   }, []);
 
   const handleLoadEnd = useCallback(() => {
@@ -534,7 +583,7 @@ export default function App() {
   }, [checkPendingShare]);
 
   useEffect(() => {
-    if (!isWebViewReady || !pendingSharedDocument) {
+    if (!pendingSharedDocument) {
       return;
     }
 
@@ -542,7 +591,6 @@ export default function App() {
       pendingSharedDocument.count === 1
         ? pendingSharedDocument.documents[0].name
         : `${pendingSharedDocument.count} documents`;
-    setShareStatus(`Attaching ${fileLabel} in Healz...`);
     if (!shareAttachStartedAtRef.current) {
       shareAttachStartedAtRef.current = Date.now();
     }
@@ -554,9 +602,32 @@ export default function App() {
       Alert.alert('Could not attach document', 'Open a Healz chat and share the file again.');
       return;
     }
+
+    // onLoadEnd reports document loading, whereas the Healz chat hydrates a
+    // little later. Keep the durable share pending and retry the bridge while
+    // that happens, rather than leaving a permanent "Preparing" state.
+    if (!isWebViewReady) {
+      setShareStatus(`Opening Healz to attach ${fileLabel}...`);
+      const retry = setTimeout(() => {
+        setShareRetryNonce((current) => current + 1);
+      }, 800);
+      return () => clearTimeout(retry);
+    }
+
+    setShareStatus(`Attaching ${fileLabel} in Healz...`);
     webViewRef.current?.injectJavaScript(
       createAttachSharedDocumentInjection(pendingSharedDocument)
     );
+
+    // A page can replace the file input while its React tree hydrates without
+    // posting a message. Retry from native code so that case cannot strand a
+    // shared document indefinitely.
+    const retry = setTimeout(() => {
+      if (pendingSharedDocumentRef.current) {
+        setShareRetryNonce((current) => current + 1);
+      }
+    }, 1500);
+    return () => clearTimeout(retry);
   }, [isWebViewReady, pendingSharedDocument, shareRetryNonce]);
 
   const handleWebMessage = useCallback(
