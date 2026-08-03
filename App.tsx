@@ -24,82 +24,90 @@ import type {
 } from 'react-native-webview/lib/WebViewTypes';
 
 const APP_URL = 'https://app.healz.ai';
+const SHARE_READ_TIMEOUT_MS = 30_000;
+const SHARE_ATTACH_TIMEOUT_MS = 60_000;
 const INTERNAL_HOSTS = new Set(['app.healz.ai', 'healz.ai', 'www.healz.ai']);
 const MOBILE_CHROME_USER_AGENT =
   'Mozilla/5.0 (Linux; Android 15; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36';
 
-// Android WebView can paint the landing page before web fonts and hydrated
-// sections have finished measuring. A focus event then fixes it by accident;
-// run the same layout pass explicitly after the page settles.
+// The landing page calculates a different responsive layout after the first
+// viewport change (for example, when the keyboard opens). Ask it to recalculate
+// a few times while it hydrates. Authenticated Healz screens additionally carry
+// a browser safe-area inset which is redundant inside the native SafeAreaView.
 const WEBVIEW_LAYOUT_FIX = `
-  (function healzWebViewLayoutFix() {
-    var styleId = 'healz-native-webview-fixes';
-    var style = document.getElementById(styleId);
-    if (!style) {
-      style = document.createElement('style');
-      style.id = styleId;
-      style.textContent = [
-        // SafeAreaView already consumes the native top inset. The chat page
-        // adds its own 52px inset for a full-screen browser, which would
-        // otherwise push the menu and new-chat controls too far down.
-        '.app-navbar { padding-top: 0 !important; }',
-        '.app-navbar > div { padding-top: 0 !important; }',
-        // Android WebView can retain stale tiles for animated blur layers
-        // while a long page is scrolled. Keep layout and fixed composer
-        // behavior, but remove effects that are purely decorative.
-        '*, *::before, *::after { animation: none !important; transition: none !important; }',
-        '[class*="backdrop-blur"] { backdrop-filter: none !important; -webkit-backdrop-filter: none !important; }',
-        '[style*="will-change"], [class*="will-change"] { will-change: auto !important; }',
-        // The testimonials use flex-1 inside clipped cards. On Android this
-        // can retain a stale grid height after hydration and place the next
-        // card over the previous one.
-        '.bg-surface-subtle { height: auto !important; min-height: 0 !important; contain: layout paint; }',
-        '.bg-surface-subtle > .flex-1 { flex: none !important; }'
-      ].join('\\n');
-      (document.head || document.documentElement).appendChild(style);
-    }
+  (function healzLandingViewportRefresh() {
+    var refresh = function () {
+      window.dispatchEvent(new Event('resize'));
+      window.dispatchEvent(new Event('orientationchange'));
+    };
 
-    var fixSidebarTop = function () {
-      document.querySelectorAll('img[alt="Healz"]').forEach(function (logo) {
-        var logoRect = logo.getBoundingClientRect();
-        var centeredContainer = logo.closest('[class*="justify-center"]');
-        if (logoRect.top > 100 && centeredContainer) {
-          centeredContainer.style.justifyContent = 'flex-start';
-          centeredContainer.style.paddingTop = '0px';
-          centeredContainer.style.marginTop = '-32px';
-
-          var sidebarLanguage = Array.prototype.slice
-            .call(document.querySelectorAll('button[aria-label="Language"]'))
-            .find(function (button) {
-              return button.getBoundingClientRect().width > 0;
-            });
-          for (var sidebarNode = sidebarLanguage?.parentElement; sidebarNode; sidebarNode = sidebarNode.parentElement) {
-            if (String(sidebarNode.className).includes('mt-[8px]')) {
-              sidebarNode.style.paddingTop = '0px';
-              break;
-            }
-          }
-        }
+    var fixAuthenticatedTopInset = function () {
+      // This class is only rendered by the authenticated app shell. Applying
+      // the correction conditionally keeps the public landing untouched.
+      document.querySelectorAll('.app-navbar').forEach(function (navbar) {
+        navbar.style.paddingTop = '0px';
+        Array.prototype.forEach.call(navbar.children, function (child) {
+          child.style.paddingTop = '0px';
+        });
       });
+
+      // The sidebar uses the same browser-only top inset through an ancestor
+      // rather than .app-navbar. Detect its language control and lift only
+      // that visible sidebar container.
+      var languageButton = Array.prototype.slice
+        .call(document.querySelectorAll('button[aria-label="Language"]'))
+        .find(function (button) {
+          var rect = button.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0;
+        });
+      if (!languageButton) return;
+
+      for (var node = languageButton.parentElement; node && node !== document.body; node = node.parentElement) {
+        var classes = typeof node.className === 'string' ? node.className : '';
+        var rect = node.getBoundingClientRect();
+        // Healz's web sidebar reserves 52px for a browser safe area. The
+        // native SafeAreaView already owns that area, so it creates the blank
+        // band above the logo, language selector, and New chat action.
+        if (classes.indexOf('mt-[8px]') !== -1 && rect.height < 140) {
+          node.style.paddingTop = '0px';
+          break;
+        }
+        if (classes.indexOf('justify-center') !== -1 && rect.height > 300) {
+          node.style.justifyContent = 'flex-start';
+          node.style.paddingTop = '0px';
+          node.style.marginTop = '0px';
+          break;
+        }
+      }
     };
 
-    var forceLayout = function () {
-      var root = document.documentElement;
-      var body = document.body;
-      if (!root || !body) return;
-
-      root.style.overflowX = 'hidden';
-      body.style.overflowX = 'hidden';
-      fixSidebarTop();
-    };
-
-    forceLayout();
-    window.addEventListener('load', forceLayout, { once: true });
+    refresh();
+    fixAuthenticatedTopInset();
+    window.addEventListener('load', function () {
+      refresh();
+      fixAuthenticatedTopInset();
+    }, { once: true });
     if (document.fonts && document.fonts.ready) {
-      document.fonts.ready.then(forceLayout).catch(function () {});
+      document.fonts.ready.then(function () {
+        refresh();
+        fixAuthenticatedTopInset();
+      }).catch(function () {});
     }
-    setTimeout(forceLayout, 250);
-    setTimeout(forceLayout, 900);
+    [250, 900, 1800].forEach(function (delay) {
+      setTimeout(function () {
+        refresh();
+        fixAuthenticatedTopInset();
+      }, delay);
+    });
+
+    // The sidebar mounts after its menu button is pressed, long after the
+    // initial load hooks have finished. A short post-click retry is cheaper
+    // than observing every DOM change for the lifetime of the WebView.
+    document.addEventListener('click', function () {
+      [0, 80, 240].forEach(function (delay) {
+        setTimeout(fixAuthenticatedTopInset, delay);
+      });
+    }, true);
   })();
   true;
 `;
@@ -294,7 +302,11 @@ export default function App() {
   const webViewRef = useRef<WebView>(null);
   const pendingSharedDocumentRef = useRef<SharedDocumentBatch | null>(null);
   const isReadingShareRef = useRef(false);
+  const shareReadStartedAtRef = useRef<number | null>(null);
+  const shareReadTimedOutRef = useRef(false);
+  const shareReadAttemptRef = useRef(0);
   const shareRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const shareAttachStartedAtRef = useRef<number | null>(null);
   const [canGoBack, setCanGoBack] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [pendingSharedDocument, setPendingSharedDocument] = useState<SharedDocumentBatch | null>(null);
@@ -440,6 +452,24 @@ export default function App() {
 
   const checkPendingShare = useCallback(async () => {
     if (
+      isReadingShareRef.current &&
+      shareReadStartedAtRef.current &&
+      Date.now() - shareReadStartedAtRef.current > SHARE_READ_TIMEOUT_MS &&
+      !shareReadTimedOutRef.current
+    ) {
+      shareReadTimedOutRef.current = true;
+      shareReadAttemptRef.current += 1;
+      isReadingShareRef.current = false;
+      shareReadStartedAtRef.current = null;
+      setShareStatus(null);
+      Alert.alert(
+        'Could not prepare document',
+        'The file provider did not respond in time. Please try sharing the file again.'
+      );
+      sharedDocumentModule?.clearPendingShare();
+    }
+
+    if (
       Platform.OS !== 'android' ||
       !sharedDocumentModule ||
       pendingSharedDocumentRef.current ||
@@ -449,9 +479,15 @@ export default function App() {
     }
 
     isReadingShareRef.current = true;
+    const attempt = ++shareReadAttemptRef.current;
+    shareReadStartedAtRef.current = Date.now();
+    shareReadTimedOutRef.current = false;
 
     try {
       const batch = await sharedDocumentModule.getPendingShare();
+      if (attempt !== shareReadAttemptRef.current || shareReadTimedOutRef.current) {
+        return;
+      }
       if (!batch || batch.documents.length === 0) {
         return;
       }
@@ -463,11 +499,17 @@ export default function App() {
         : `Preparing ${fileLabel} for Healz...`;
       setShareStatus(status);
     } catch (error) {
+      if (attempt !== shareReadAttemptRef.current || shareReadTimedOutRef.current) {
+        return;
+      }
       const message = error instanceof Error ? error.message : 'Could not read shared document.';
       Alert.alert('Could not import shared document', message);
       sharedDocumentModule.clearPendingShare();
     } finally {
-      isReadingShareRef.current = false;
+      if (attempt === shareReadAttemptRef.current) {
+        isReadingShareRef.current = false;
+        shareReadStartedAtRef.current = null;
+      }
     }
   }, []);
 
@@ -501,6 +543,17 @@ export default function App() {
         ? pendingSharedDocument.documents[0].name
         : `${pendingSharedDocument.count} documents`;
     setShareStatus(`Attaching ${fileLabel} in Healz...`);
+    if (!shareAttachStartedAtRef.current) {
+      shareAttachStartedAtRef.current = Date.now();
+    }
+    if (Date.now() - shareAttachStartedAtRef.current > SHARE_ATTACH_TIMEOUT_MS) {
+      setPendingSharedDocument(null);
+      setShareStatus(null);
+      shareAttachStartedAtRef.current = null;
+      sharedDocumentModule?.clearPendingShare();
+      Alert.alert('Could not attach document', 'Open a Healz chat and share the file again.');
+      return;
+    }
     webViewRef.current?.injectJavaScript(
       createAttachSharedDocumentInjection(pendingSharedDocument)
     );
@@ -534,6 +587,7 @@ export default function App() {
 
         setPendingSharedDocument(null);
         setShareStatus(null);
+        shareAttachStartedAtRef.current = null;
         sharedDocumentModule?.clearPendingShare();
 
         if (message.status === 'error') {
@@ -583,9 +637,8 @@ export default function App() {
       onMessage={handleWebMessage}
       onLoadEnd={handleLoadEnd}
       injectedJavaScript={WEBVIEW_LAYOUT_FIX}
-      // Software compositing avoids stale tiles from distant sections on
-      // Android WebView. Expensive DOM observers and visual effects above
-      // are disabled so this fallback does not compound the cost.
+      // Android WebView occasionally reuses stale hardware tiles on the
+      // landing page, duplicating the promo banner over the composer.
       androidLayerType="software"
       javaScriptEnabled
       domStorageEnabled

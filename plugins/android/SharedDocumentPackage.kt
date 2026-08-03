@@ -25,6 +25,7 @@ import com.facebook.react.bridge.WritableMap
 import com.facebook.react.uimanager.ViewManager
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import org.json.JSONArray
 import kotlin.math.max
 import kotlin.math.roundToInt
 
@@ -56,6 +57,7 @@ object SharedDocumentStore {
   private const val PREF_ACTION = "action"
   private const val PREF_TYPE = "type"
   private const val PREF_URIS = "uris"
+  private const val PREF_URIS_JSON = "uris_json"
   private var pendingIntent: Intent? = null
 
   fun capture(context: Context, intent: Intent?) {
@@ -69,11 +71,25 @@ object SharedDocumentStore {
     }
 
     pendingIntent = Intent(intent)
-    context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-      .edit()
+    val uriArray = JSONArray()
+    uris.forEach { uri ->
+      // Some document providers only grant access for the lifetime of the
+      // activity. Keep a persistable grant when the provider supports it.
+      runCatching {
+        context.contentResolver.takePersistableUriPermission(
+          uri,
+          Intent.FLAG_GRANT_READ_URI_PERMISSION
+        )
+      }
+      uriArray.put(uri.toString())
+    }
+
+    context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
       .putString(PREF_ACTION, intent.action)
       .putString(PREF_TYPE, intent.type)
-      .putStringSet(PREF_URIS, uris.map(Uri::toString).toSet())
+      // StringSet does not preserve order. JSON keeps multi-file shares
+      // deterministic and remains readable after process death.
+      .putString(PREF_URIS_JSON, uriArray.toString())
       .apply()
   }
 
@@ -132,7 +148,16 @@ object SharedDocumentStore {
   private fun restoreIntent(context: Context): Intent? {
     val preferences = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     val action = preferences.getString(PREF_ACTION, null) ?: return null
-    val uris = preferences.getStringSet(PREF_URIS, emptySet())?.map(Uri::parse).orEmpty()
+    val savedJson = preferences.getString(PREF_URIS_JSON, null)
+    val uris = if (!savedJson.isNullOrBlank()) {
+      runCatching {
+        val array = JSONArray(savedJson)
+        (0 until array.length()).map { Uri.parse(array.getString(it)) }
+      }.getOrDefault(emptyList())
+    } else {
+      // Read old builds' preferences once for backwards compatibility.
+      preferences.getStringSet(PREF_URIS, emptySet())?.map(Uri::parse).orEmpty()
+    }
     if (uris.isEmpty()) {
       return null
     }
@@ -206,17 +231,37 @@ object SharedDocumentStore {
   }
 
   private fun readBytes(resolver: ContentResolver, uri: Uri): ByteArray {
+    val declaredSize = runCatching {
+      resolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)?.use { cursor ->
+        if (cursor.moveToFirst() && !cursor.isNull(0)) cursor.getLong(0) else null
+      }
+    }.getOrNull()
+    if (declaredSize != null) {
+      require(declaredSize in 0..MAX_SHARED_FILE_BYTES.toLong()) {
+        "File is larger than 12 MB. Please choose a smaller file."
+      }
+    }
+
     resolver.openInputStream(uri).use { input ->
       requireNotNull(input) { "Could not open shared file." }
       val output = ByteArrayOutputStream()
       val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-      var total = 0
+      var total = 0L
+      var emptyReads = 0
 
       while (true) {
         val read = input.read(buffer)
         if (read == -1) break
+        if (read == 0) {
+          emptyReads += 1
+          if (emptyReads > 8) {
+            throw IllegalArgumentException("The file provider stopped returning data.")
+          }
+          continue
+        }
+        emptyReads = 0
         total += read
-        if (total > MAX_SHARED_FILE_BYTES) {
+        if (total > MAX_SHARED_FILE_BYTES.toLong()) {
           throw IllegalArgumentException("File is larger than 12 MB. Please choose a smaller file.")
         }
         output.write(buffer, 0, read)
@@ -242,7 +287,17 @@ object SharedDocumentStore {
       return PreparedDocument(bytes, name, mimeType, bytes.size, compressed = false)
     }
 
-    if (!mimeType.startsWith("image/") || bytes.size <= IMAGE_COMPRESSION_THRESHOLD_BYTES) {
+    if (!mimeType.startsWith("image/")) {
+      return PreparedDocument(bytes, name, mimeType, bytes.size, compressed = false)
+    }
+
+    // Validate even small images. Passing a mislabeled or truncated URI
+    // through is a common cause of a later "failed to load file" message.
+    if (!isDecodableImage(bytes)) {
+      throw IllegalArgumentException("This image is damaged or not supported.")
+    }
+
+    if (bytes.size <= IMAGE_COMPRESSION_THRESHOLD_BYTES) {
       Log.i("SharedDocument", "Keeping original shared document (${bytes.size} bytes, type=$mimeType).")
       return PreparedDocument(bytes, name, mimeType, bytes.size, compressed = false)
     }
@@ -301,6 +356,10 @@ object SharedDocumentStore {
     val compressedBytes = compressWithQualityFloor(flattened)
     flattened.recycle()
 
+    if (compressedBytes.isEmpty()) {
+      return null
+    }
+
     return PreparedDocument(
       bytes = compressedBytes,
       name = replaceExtensionWithJpeg(name),
@@ -358,6 +417,19 @@ object SharedDocumentStore {
     return best
   }
 
+  private fun isDecodableImage(bytes: ByteArray): Boolean {
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+    if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return false
+
+    return BitmapFactory.decodeByteArray(
+      bytes,
+      0,
+      bytes.size,
+      BitmapFactory.Options().apply { inSampleSize = calculateSampleSize(bounds.outWidth, bounds.outHeight) }
+    )?.also { it.recycle() } != null
+  }
+
   private fun detectMimeType(bytes: ByteArray, declaredMimeType: String): String {
     return when {
       hasPdfSignature(bytes) -> "application/pdf"
@@ -372,7 +444,8 @@ object SharedDocumentStore {
   }
 
   private fun hasPdfSignature(bytes: ByteArray): Boolean {
-    return bytes.size >= 5 && String(bytes, 0, 5, Charsets.US_ASCII) == "%PDF-"
+    val scanLength = minOf(bytes.size, 1024)
+    return scanLength >= 5 && String(bytes, 0, scanLength, Charsets.US_ASCII).contains("%PDF-")
   }
 
   private fun hasBytes(bytes: ByteArray, signature: ByteArray): Boolean {
