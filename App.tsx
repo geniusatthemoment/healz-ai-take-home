@@ -31,14 +31,23 @@ const MOBILE_CHROME_USER_AGENT =
   'Mozilla/5.0 (Linux; Android 15; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36';
 
 // The landing page calculates a different responsive layout after the first
-// viewport change (for example, when the keyboard opens). Ask it to recalculate
-// a few times while it hydrates. Authenticated Healz screens additionally carry
-// a browser safe-area inset which is redundant inside the native SafeAreaView.
+// viewport change (for example, when the keyboard opens). Keep this to one
+// coalesced recalculation so the WebView does not repeatedly invalidate its
+// entire document while it is hydrating. Authenticated Healz screens
+// additionally carry a browser safe-area inset which is redundant inside the
+// native SafeAreaView.
 const WEBVIEW_LAYOUT_FIX = `
   (function healzLandingViewportRefresh() {
-    var refresh = function () {
-      window.dispatchEvent(new Event('resize'));
-      window.dispatchEvent(new Event('orientationchange'));
+    var refreshTimer = null;
+    var scheduleRefresh = function (delay) {
+      if (refreshTimer !== null) {
+        clearTimeout(refreshTimer);
+      }
+      refreshTimer = setTimeout(function () {
+        refreshTimer = null;
+        window.dispatchEvent(new Event('resize'));
+        fixAuthenticatedTopInset();
+      }, delay || 0);
     };
 
     var fixAuthenticatedTopInset = function () {
@@ -81,33 +90,42 @@ const WEBVIEW_LAYOUT_FIX = `
       }
     };
 
-    refresh();
+    scheduleRefresh(0);
     fixAuthenticatedTopInset();
     window.addEventListener('load', function () {
-      refresh();
-      fixAuthenticatedTopInset();
+      scheduleRefresh(120);
     }, { once: true });
     if (document.fonts && document.fonts.ready) {
       document.fonts.ready.then(function () {
-        refresh();
-        fixAuthenticatedTopInset();
+        scheduleRefresh(120);
       }).catch(function () {});
     }
-    [250, 900, 1800].forEach(function (delay) {
-      setTimeout(function () {
-        refresh();
-        fixAuthenticatedTopInset();
-      }, delay);
-    });
 
     // The sidebar mounts after its menu button is pressed, long after the
-    // initial load hooks have finished. A short post-click retry is cheaper
-    // than observing every DOM change for the lifetime of the WebView.
+    // initial load hooks have finished. Coalesce rapid taps into one delayed
+    // check instead of forcing three DOM scans after every click on the page.
+    var clickFixTimer = null;
     document.addEventListener('click', function () {
-      [0, 80, 240].forEach(function (delay) {
-        setTimeout(fixAuthenticatedTopInset, delay);
-      });
+      if (clickFixTimer !== null) {
+        clearTimeout(clickFixTimer);
+      }
+      clickFixTimer = setTimeout(function () {
+        clickFixTimer = null;
+        fixAuthenticatedTopInset();
+      }, 160);
     }, true);
+
+    // Backdrop blur on a sticky element creates a large GPU surface in
+    // Android WebView. Keep the same opaque visual treatment without asking
+    // the compositor to blur the complete page behind the navbar.
+    document.querySelectorAll('nav').forEach(function (navbar) {
+      var style = window.getComputedStyle(navbar);
+      if (style.position === 'sticky' && style.backdropFilter !== 'none') {
+        navbar.style.backdropFilter = 'none';
+        navbar.style.webkitBackdropFilter = 'none';
+        navbar.style.backgroundColor = 'rgba(255, 255, 255, 0.96)';
+      }
+    });
   })();
   true;
 `;
@@ -136,6 +154,9 @@ type SharedDocumentBatch = {
 type SharedDocumentModule = {
   getPendingShare: () => Promise<SharedDocumentBatch | null>;
   clearPendingShare: () => void;
+  invalidateWebView?: () => void;
+  installWebViewRedrawHooks?: () => void;
+  rebuildWebViewLayer?: () => void;
 };
 
 type WebShareMessage = {
@@ -476,6 +497,11 @@ export default function App() {
 
   const handleLoadEnd = useCallback(() => {
     setIsWebViewReady(true);
+    if (Platform.OS === 'android') {
+      sharedDocumentModule?.installWebViewRedrawHooks?.();
+      sharedDocumentModule?.rebuildWebViewLayer?.();
+      sharedDocumentModule?.invalidateWebView?.();
+    }
   }, []);
 
   const handleLoadError = useCallback((event: WebViewErrorEvent) => {
@@ -569,6 +595,11 @@ export default function App() {
     const subscription = AppState.addEventListener('change', (state) => {
       if (state === 'active') {
         checkPendingShare();
+        if (Platform.OS === 'android') {
+          sharedDocumentModule?.installWebViewRedrawHooks?.();
+          sharedDocumentModule?.rebuildWebViewLayer?.();
+          sharedDocumentModule?.invalidateWebView?.();
+        }
       }
     });
 
@@ -708,9 +739,6 @@ export default function App() {
       onMessage={handleWebMessage}
       onLoadEnd={handleLoadEnd}
       injectedJavaScript={WEBVIEW_LAYOUT_FIX}
-      // Android WebView occasionally reuses stale hardware tiles on the
-      // landing page, duplicating the promo banner over the composer.
-      androidLayerType="software"
       javaScriptEnabled
       domStorageEnabled
       cacheEnabled

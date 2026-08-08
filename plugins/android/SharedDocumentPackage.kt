@@ -14,6 +14,9 @@ import android.net.Uri
 import android.provider.OpenableColumns
 import android.util.Base64
 import android.util.Log
+import android.view.View
+import android.view.ViewGroup
+import android.webkit.WebView
 import com.facebook.react.ReactPackage
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.NativeModule
@@ -29,6 +32,7 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.util.UUID
+import java.util.WeakHashMap
 import org.json.JSONArray
 import kotlin.math.max
 import kotlin.math.roundToInt
@@ -569,7 +573,54 @@ object SharedDocumentStore {
 class SharedDocumentModule(
   private val reactContext: ReactApplicationContext
 ) : ReactContextBaseJavaModule(reactContext) {
+  private val hookedWebViews = WeakHashMap<WebView, Boolean>()
+
   override fun getName(): String = "SharedDocument"
+
+  @ReactMethod
+  fun installWebViewRedrawHooks() {
+    val activity = reactContext.currentActivity ?: return
+    activity.runOnUiThread {
+      val install: () -> Unit = {
+        val installedHooks = installWebViewRedrawHooks(activity.window.decorView)
+        Log.d("SharedDocument", "Installed redraw hooks on $installedHooks WebView(s).")
+      }
+
+      install()
+    }
+  }
+
+  @ReactMethod
+  fun invalidateWebView() {
+    val activity = reactContext.currentActivity ?: return
+    activity.runOnUiThread {
+      val redraw: () -> Unit = {
+        val invalidatedViews = invalidateWebViews(activity.window.decorView)
+        Log.d("SharedDocument", "Requested redraw for $invalidatedViews WebView(s).")
+      }
+
+      redraw()
+    }
+  }
+
+  @ReactMethod
+  fun rebuildWebViewLayer() {
+    val activity = reactContext.currentActivity ?: return
+    activity.runOnUiThread {
+      forEachWebView(activity.window.decorView) { webView ->
+        // Keep WebView on its default accelerated surface. A one-pixel scroll
+        // below is enough to make Chromium repaint stale tiles without
+        // creating a separate explicit hardware layer.
+        webView.setLayerType(View.LAYER_TYPE_NONE, null)
+        webView.postDelayed({
+          if (!webView.isAttachedToWindow) return@postDelayed
+          webView.requestLayout()
+          webView.invalidate()
+          webView.postInvalidateOnAnimation()
+        }, 16L)
+      }
+    }
+  }
 
   @ReactMethod
   fun getPendingShare(promise: Promise) {
@@ -583,6 +634,57 @@ class SharedDocumentModule(
   @ReactMethod
   fun clearPendingShare() {
     SharedDocumentStore.clear(reactContext)
+  }
+
+  private fun installWebViewRedrawHooks(view: View): Int {
+    var installedHooks = 0
+
+    if (view is WebView && !hookedWebViews.containsKey(view)) {
+      view.addOnLayoutChangeListener { changedView, _, _, _, _, _, _, _, _ ->
+        changedView.invalidate()
+        changedView.postInvalidateOnAnimation()
+      }
+      hookedWebViews[view] = true
+      installedHooks += 1
+    }
+
+    if (view is ViewGroup) {
+      for (index in 0 until view.childCount) {
+        installedHooks += installWebViewRedrawHooks(view.getChildAt(index))
+      }
+    }
+
+    return installedHooks
+  }
+
+  private fun invalidateWebViews(view: View): Int {
+    var invalidatedViews = 0
+
+    if (view is WebView) {
+      view.invalidate()
+      view.postInvalidateOnAnimation()
+      invalidatedViews += 1
+    }
+
+    if (view is ViewGroup) {
+      for (index in 0 until view.childCount) {
+        invalidatedViews += invalidateWebViews(view.getChildAt(index))
+      }
+    }
+
+    return invalidatedViews
+  }
+
+  private fun forEachWebView(view: View, action: (WebView) -> Unit) {
+    if (view is WebView) {
+      action(view)
+    }
+
+    if (view is ViewGroup) {
+      for (index in 0 until view.childCount) {
+        forEachWebView(view.getChildAt(index), action)
+      }
+    }
   }
 }
 

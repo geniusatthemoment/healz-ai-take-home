@@ -38,6 +38,11 @@ function updateAndroidManifest(projectRoot) {
     );
   }
 
+  manifest = manifest.replace(
+    /\s*<uses-permission android:name="android\.permission\.SYSTEM_ALERT_WINDOW"\s*\/>/g,
+    ''
+  );
+
   fs.writeFileSync(
     manifestPath,
     addOnce(
