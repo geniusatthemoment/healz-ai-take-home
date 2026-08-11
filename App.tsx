@@ -27,6 +27,7 @@ import type {
 const APP_URL = 'https://app.healz.ai';
 const SHARE_READ_TIMEOUT_MS = 30_000;
 const SHARE_ATTACH_TIMEOUT_MS = 60_000;
+const SHOW_CHAT_REFRESH = false;
 const INTERNAL_HOSTS = new Set(['app.healz.ai', 'healz.ai', 'www.healz.ai']);
 const MOBILE_CHROME_USER_AGENT =
   'Mozilla/5.0 (Linux; Android 15; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36';
@@ -443,67 +444,108 @@ const CREATE_NEW_CHAT_INJECTION = `
       var rect = element.getBoundingClientRect();
       return rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.top < window.innerHeight;
     };
-    var findTarget = function () {
+    var describe = function (element) {
+      return [
+        element.getAttribute('aria-label'),
+        element.getAttribute('title'),
+        element.getAttribute('data-testid'),
+        element.textContent
+      ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
+    };
+    var findExplicitTarget = function () {
       var controls = Array.prototype.slice.call(document.querySelectorAll(
         'button:not([disabled]), a, [role="button"], [tabindex], [aria-label], [data-testid]'
       ));
       return controls.find(function (element) {
         if (!visible(element)) return false;
-        var text = [
-          element.getAttribute('aria-label'),
-          element.getAttribute('title'),
-          element.getAttribute('data-testid'),
-          element.getAttribute('class'),
-          element.textContent
-        ].filter(Boolean).join(' ');
-        return /new chat|new case|start chat|new conversation|create chat|compose|add chat|plus/i.test(text);
+        return /^(new chat|new case|start (a )?chat|new conversation|create chat|compose)$/i.test(describe(element));
       });
     };
-    var openSidebar = function () {
+    var findGlobalNewChatButton = function () {
+      var buttons = Array.prototype.slice.call(document.querySelectorAll('button:not([disabled])'));
+      return buttons.find(function (button) {
+        if (!visible(button) || button.closest('[role="dialog"]')) return false;
+        var rect = button.getBoundingClientRect();
+        var text = describe(button);
+        var looksLikeNewChat = /new chat|new case|create chat|compose|add chat/i.test(text);
+        var isHeaderAction = rect.top < 190 && rect.right > window.innerWidth * 0.82 &&
+          rect.width >= 28 && rect.width <= 90 && rect.height >= 28 && rect.height <= 90;
+        return looksLikeNewChat || (isHeaderAction && !!button.querySelector('svg'));
+      });
+    };
+    var findMenuButton = function () {
       var controls = Array.prototype.slice.call(document.querySelectorAll(
         'button:not([disabled]), [role="button"], [aria-label], [data-testid]'
       ));
-      var menu = controls.find(function (element) {
-        if (!visible(element)) return false;
-        var text = [
-          element.getAttribute('aria-label'),
-          element.getAttribute('title'),
-          element.getAttribute('data-testid'),
-          element.getAttribute('class')
-        ].filter(Boolean).join(' ');
+      return controls.find(function (element) {
+        if (!visible(element) || element.closest('[role="dialog"]')) return false;
+        var text = describe(element);
         if (/menu|sidebar|navigation|open chats|hamburger/i.test(text)) return true;
-        return !!element.querySelector('svg') && element.getBoundingClientRect().width < 64;
+        var rect = element.getBoundingClientRect();
+        return !!element.querySelector('svg') && rect.width < 72 && rect.height < 72 && rect.left < 100;
       });
-      if (menu) menu.click();
     };
-    var tryCreate = function (attempt) {
-      var target = findTarget();
-      if (!target && attempt === 0) {
-        openSidebar();
-      }
-      if (!target && attempt < 12) {
-        setTimeout(function () { tryCreate(attempt + 1); }, 250);
-        return;
-      }
-      if (!target) {
+    var report = function (status, message) {
       window.ReactNativeWebView.postMessage(JSON.stringify({
         source: 'healz-share-target',
-        status: 'error',
-        message: 'Could not find the New chat button in Healz.'
+        status: status,
+        message: message
       }));
-      return true;
-      }
-
+    };
+    var finished = false;
+    var finish = function (target) {
+      if (finished) return;
+      finished = true;
       target.click();
       setTimeout(function () {
-        window.ReactNativeWebView.postMessage(JSON.stringify({
-          source: 'healz-share-target',
-          status: 'chat-selected',
-          message: 'A new chat is opening.'
-        }));
-      }, 900);
+        report('chat-selected', 'A new chat is opening.');
+      }, 800);
     };
-    tryCreate(0);
+
+    var directTarget = findExplicitTarget() || findGlobalNewChatButton();
+    if (directTarget) {
+      finish(directTarget);
+      return true;
+    }
+
+    // Some Healz tabs only expose New chat inside the mobile drawer. Mount it
+    // invisibly behind the native picker, click the exact row, and let React
+    // unmount it as the new conversation opens.
+    var menu = findMenuButton();
+    if (!menu) {
+      report('error', 'Could not find the New chat action in Healz.');
+      return true;
+    }
+    var observer = new MutationObserver(function () {
+      var drawer = document.querySelector('[role="dialog"]');
+      if (!drawer) return;
+      drawer.style.visibility = 'hidden';
+      var elements = Array.prototype.slice.call(drawer.querySelectorAll('button, a, [role="button"], div'));
+      var target = elements.find(function (element) {
+        return /^new chat$/i.test(describe(element));
+      });
+      if (!target) return;
+      observer.disconnect();
+      finish(target);
+    });
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+    menu.click();
+    setTimeout(function () {
+      if (finished) return;
+      observer.disconnect();
+      var drawer = document.querySelector('[role="dialog"]');
+      var elements = drawer
+        ? Array.prototype.slice.call(drawer.querySelectorAll('button, a, [role="button"], div'))
+        : [];
+      var target = elements.find(function (element) {
+        return /^new chat$/i.test(describe(element));
+      });
+      if (target) {
+        finish(target);
+      } else {
+        report('error', 'Could not find the New chat action in Healz.');
+      }
+    }, 1200);
   })();
   true;
 `;
@@ -927,6 +969,9 @@ export default function App() {
       setIsChatPickerVisible(true);
       setPendingSharedDocument(batch);
       setShareStatus(null);
+      webViewRef.current?.injectJavaScript(
+        'window.__healzShareCompletedBatch = null; true;'
+      );
     } catch (error) {
       if (attempt !== shareReadAttemptRef.current || shareReadTimedOutRef.current) {
         return;
@@ -989,14 +1034,9 @@ export default function App() {
   }, []);
 
   const handleCreateNewChat = useCallback(() => {
-    setIsChatPickerVisible(false);
-    // Keep the original, proven flow for a new chat: the Healz page opens its
-    // own composer/file picker, and the existing attachment bridge waits for
-    // the file input to appear. The native picker only decides when to start
-    // that flow; it does not need to know Healz's private button selectors.
-    attachRequestedRef.current = true;
+    setIsChatPickerLoading(true);
     setShareStatus('Opening a new Healz chat...');
-    setShareRetryNonce((current) => current + 1);
+    webViewRef.current?.injectJavaScript(CREATE_NEW_CHAT_INJECTION);
   }, []);
 
   useEffect(() => {
@@ -1254,7 +1294,7 @@ export default function App() {
                   </ScrollView>
                 )}
 
-                {!isChatPickerLoading && (
+                {SHOW_CHAT_REFRESH && !isChatPickerLoading && (
                   <Pressable style={styles.retryChatButton} onPress={handleRetryChatList}>
                     <Text style={styles.retryChatButtonText}>Refresh chat list</Text>
                   </Pressable>
