@@ -163,7 +163,7 @@ type SharedDocumentModule = {
 
 type WebShareMessage = {
   source: 'healz-share-target';
-  status: 'attached' | 'waiting' | 'error' | 'chats' | 'chat-selected';
+  status: 'attached' | 'waiting' | 'error' | 'chats' | 'chat-selected' | 'vault-selected';
   message: string;
   chats?: ChatOption[];
 };
@@ -576,12 +576,16 @@ function resolveHealzDeepLink(url: string | null | undefined) {
   return `${APP_URL}/${route}`;
 }
 
-function createAttachSharedDocumentInjection(batch: SharedDocumentBatch) {
+function createAttachSharedDocumentInjection(
+  batch: SharedDocumentBatch,
+  destination: 'chat' | 'vault'
+) {
   const payload = JSON.stringify(batch);
 
   return `
     (function attachSharedDocument() {
       var sharedBatch = ${payload};
+      var destination = ${JSON.stringify(destination)};
       var sharedDocuments = sharedBatch.documents || [];
       var batchKey = sharedDocuments.map(function (document) {
         return [document.uri, document.name, document.size].join('|');
@@ -651,6 +655,14 @@ function createAttachSharedDocumentInjection(batch: SharedDocumentBatch) {
         return bytes;
       };
 
+      var createSharedFile = function (sharedDocument) {
+        return new File(
+          [base64ToBytes(sharedDocument.base64)],
+          sharedDocument.name,
+          { type: sharedDocument.type }
+        );
+      };
+
       var attachToInput = function (input, finish) {
         if (sharedDocuments.length === 0) {
           finish('error', 'No shared documents were received from Android.');
@@ -660,12 +672,7 @@ function createAttachSharedDocumentInjection(batch: SharedDocumentBatch) {
         var transfer = new DataTransfer();
 
         sharedDocuments.forEach(function (sharedDocument) {
-          var file = new File(
-            [base64ToBytes(sharedDocument.base64)],
-            sharedDocument.name,
-            { type: sharedDocument.type }
-          );
-          transfer.items.add(file);
+          transfer.items.add(createSharedFile(sharedDocument));
         });
 
         input.files = transfer.files;
@@ -673,33 +680,81 @@ function createAttachSharedDocumentInjection(batch: SharedDocumentBatch) {
         input.dispatchEvent(new Event('change', { bubbles: true }));
       };
 
-      if (window.__healzShareActiveBatch === batchKey) {
-        report('waiting', 'Waiting for the Healz chat to finish loading.');
+      var activeBatchKey = destination + '::' + batchKey;
+      if (window.__healzShareActiveBatch === activeBatchKey) {
+        // The native layer retries while Healz hydrates. The original bridge
+        // remains responsible for reporting its eventual result.
         return true;
       }
-      if (window.__healzShareCompletedBatch === batchKey) {
+      if (window.__healzShareCompletedBatch === activeBatchKey) {
         report('attached', 'Shared file was already passed to Healz.');
         return true;
       }
-      window.__healzShareActiveBatch = batchKey;
+      window.__healzShareActiveBatch = activeBatchKey;
 
       var startedAt = Date.now();
-      var deadlineMs = 12000;
+      var deadlineMs = destination === 'vault' ? 120000 : 12000;
       var pickerOpened = false;
       var completed = false;
+      var vaultUploadStarted = false;
       var finish = function (status, message) {
         if (completed) return;
         completed = true;
         if (status === 'attached') {
-          window.__healzShareCompletedBatch = batchKey;
+          window.__healzShareCompletedBatch = activeBatchKey;
         }
         window.__healzShareActiveBatch = null;
         window.__healzShareAttachRequested = false;
         report(status, message);
       };
 
+      var uploadDirectlyToVault = function () {
+        if (vaultUploadStarted || completed) return;
+        if (sharedDocuments.length === 0) {
+          finish('error', 'No shared documents were received from Android.');
+          return;
+        }
+        vaultUploadStarted = true;
+
+        Promise.all(sharedDocuments.map(function (sharedDocument) {
+          var formData = new FormData();
+          formData.append('file', createSharedFile(sharedDocument));
+          return window.fetch('/api/documents', {
+            method: 'POST',
+            body: formData,
+            credentials: 'same-origin'
+          });
+        })).then(function (responses) {
+          var failedResponse = responses.find(function (response) {
+            return !response.ok;
+          });
+          if (failedResponse) {
+            finish(
+              'error',
+              'Secure File Vault rejected the shared document (HTTP ' + failedResponse.status + ').'
+            );
+            return;
+          }
+          finish(
+            'attached',
+            sharedDocuments.length === 1
+              ? 'Shared file was saved to Secure File Vault.'
+              : sharedDocuments.length + ' shared files were saved to Secure File Vault.'
+          );
+          setTimeout(function () {
+            window.location.reload();
+          }, 500);
+        }).catch(function () {
+          finish('error', 'Could not save the shared document to Secure File Vault.');
+        });
+      };
+
       var tryAttach = function () {
         if (completed) return;
+        if (destination === 'vault') {
+          uploadDirectlyToVault();
+          return;
+        }
         var input = findFileInput();
         if (input) {
           try {
@@ -742,7 +797,12 @@ function createAttachSharedDocumentInjection(batch: SharedDocumentBatch) {
       var poll = function () {
         if (completed) return;
         if (Date.now() - startedAt >= deadlineMs) {
-          finish('waiting', 'Open a Healz chat. The shared document will attach automatically.');
+          finish(
+            destination === 'vault' ? 'error' : 'waiting',
+            destination === 'vault'
+              ? 'Could not find the Secure File Vault uploader. Please try again.'
+              : 'Open a Healz chat. The shared document will attach automatically.'
+          );
           return;
         }
         setTimeout(tryAttach, 250);
@@ -770,6 +830,7 @@ export default function App() {
   const shareAttachStartedAtRef = useRef<number | null>(null);
   const chatListRequestKeyRef = useRef<string | null>(null);
   const attachRequestedRef = useRef(false);
+  const attachmentDestinationRef = useRef<'chat' | 'vault'>('chat');
   const [canGoBack, setCanGoBack] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [pendingSharedDocument, setPendingSharedDocument] = useState<SharedDocumentBatch | null>(null);
@@ -964,6 +1025,7 @@ export default function App() {
 
       chatListRequestKeyRef.current = null;
       attachRequestedRef.current = false;
+      attachmentDestinationRef.current = 'chat';
       setChatOptions([]);
       setIsChatPickerLoading(true);
       setIsChatPickerVisible(true);
@@ -1018,6 +1080,7 @@ export default function App() {
     shareAttachStartedAtRef.current = null;
     chatListRequestKeyRef.current = null;
     attachRequestedRef.current = false;
+    attachmentDestinationRef.current = 'chat';
     sharedDocumentModule?.clearPendingShare();
   }, []);
 
@@ -1028,15 +1091,25 @@ export default function App() {
   }, []);
 
   const handleSelectChat = useCallback((chat: ChatOption) => {
+    attachmentDestinationRef.current = 'chat';
     setIsChatPickerLoading(true);
     setShareStatus(`Opening ${chat.title}...`);
     webViewRef.current?.injectJavaScript(createSelectChatInjection(chat.key));
   }, []);
 
   const handleCreateNewChat = useCallback(() => {
+    attachmentDestinationRef.current = 'chat';
     setIsChatPickerLoading(true);
     setShareStatus('Opening a new Healz chat...');
     webViewRef.current?.injectJavaScript(CREATE_NEW_CHAT_INJECTION);
+  }, []);
+
+  const handleOpenSecureVault = useCallback(() => {
+    attachmentDestinationRef.current = 'vault';
+    attachRequestedRef.current = true;
+    setIsChatPickerVisible(false);
+    setShareStatus('Preparing the file for Secure File Vault...');
+    setShareRetryNonce((current) => current + 1);
   }, []);
 
   useEffect(() => {
@@ -1076,7 +1149,9 @@ export default function App() {
     if (!shareAttachStartedAtRef.current) {
       shareAttachStartedAtRef.current = Date.now();
     }
-    if (Date.now() - shareAttachStartedAtRef.current > SHARE_ATTACH_TIMEOUT_MS) {
+    const attachTimeoutMs =
+      attachmentDestinationRef.current === 'vault' ? 150_000 : SHARE_ATTACH_TIMEOUT_MS;
+    if (Date.now() - shareAttachStartedAtRef.current > attachTimeoutMs) {
       setIsChatPickerVisible(false);
       setPendingSharedDocument(null);
       setShareStatus(null);
@@ -1098,9 +1173,16 @@ export default function App() {
       return () => clearTimeout(retry);
     }
 
-    setShareStatus(`Attaching ${fileLabel} in this chat...`);
+    setShareStatus(
+      attachmentDestinationRef.current === 'vault'
+        ? `Saving ${fileLabel} to Secure File Vault...`
+        : `Attaching ${fileLabel} in this chat...`
+    );
     webViewRef.current?.injectJavaScript(
-      createAttachSharedDocumentInjection(pendingSharedDocument)
+      createAttachSharedDocumentInjection(
+        pendingSharedDocument,
+        attachmentDestinationRef.current
+      )
     );
 
     // A page can replace the file input while its React tree hydrates without
@@ -1129,9 +1211,19 @@ export default function App() {
         }
 
         if (message.status === 'chat-selected') {
+          attachmentDestinationRef.current = 'chat';
           attachRequestedRef.current = true;
           setIsChatPickerVisible(false);
           setShareStatus('Preparing the file for this chat...');
+          setShareRetryNonce((current) => current + 1);
+          return;
+        }
+
+        if (message.status === 'vault-selected') {
+          attachmentDestinationRef.current = 'vault';
+          attachRequestedRef.current = true;
+          setIsChatPickerVisible(false);
+          setShareStatus('Preparing the file for Secure File Vault...');
           setShareRetryNonce((current) => current + 1);
           return;
         }
@@ -1140,7 +1232,7 @@ export default function App() {
           setIsChatPickerVisible(true);
           setIsChatPickerLoading(false);
           setShareStatus(null);
-          Alert.alert('Could not choose a chat', message.message);
+          Alert.alert('Could not choose a destination', message.message);
           return;
         }
 
@@ -1167,6 +1259,7 @@ export default function App() {
         setShareStatus(null);
         shareAttachStartedAtRef.current = null;
         attachRequestedRef.current = false;
+        attachmentDestinationRef.current = 'chat';
         sharedDocumentModule?.clearPendingShare();
 
         if (message.status === 'error') {
@@ -1287,6 +1380,16 @@ export default function App() {
                         No existing chats were found. You can start a new one.
                       </Text>
                     )}
+
+                    <Pressable style={styles.vaultButton} onPress={handleOpenSecureVault}>
+                      <View style={styles.vaultButtonIcon}>
+                        <Text style={styles.vaultButtonIconText}>▣</Text>
+                      </View>
+                      <View style={styles.vaultButtonCopy}>
+                        <Text style={styles.vaultButtonTitle}>Secure File Vault</Text>
+                        <Text style={styles.vaultButtonSubtitle}>Save without adding to a chat</Text>
+                      </View>
+                    </Pressable>
 
                     <Pressable style={styles.newChatButton} onPress={handleCreateNewChat}>
                       <Text style={styles.newChatButtonText}>＋ New chat</Text>
@@ -1442,6 +1545,44 @@ const styles = StyleSheet.create({
     fontSize: 14,
     lineHeight: 20,
     textAlign: 'center',
+  },
+  vaultButton: {
+    minHeight: 64,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    borderWidth: 1,
+    borderColor: '#eadde2',
+    borderRadius: 16,
+    backgroundColor: '#fff9fb',
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  vaultButtonIcon: {
+    width: 36,
+    height: 36,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 12,
+    backgroundColor: '#f0d9e2',
+  },
+  vaultButtonIconText: {
+    color: '#6d5260',
+    fontSize: 18,
+    fontWeight: '800',
+  },
+  vaultButtonCopy: {
+    flex: 1,
+  },
+  vaultButtonTitle: {
+    color: '#2f2530',
+    fontSize: 15,
+    fontWeight: '800',
+  },
+  vaultButtonSubtitle: {
+    marginTop: 2,
+    color: '#7a7076',
+    fontSize: 12,
   },
   newChatButton: {
     minHeight: 52,

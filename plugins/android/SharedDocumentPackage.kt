@@ -634,6 +634,16 @@ class SharedDocumentModule(
   @ReactMethod
   fun clearPendingShare() {
     SharedDocumentStore.clear(reactContext)
+    val activity = reactContext.currentActivity ?: return
+    activity.runOnUiThread {
+      // ACTION_SEND remains attached to a reused launcher Activity after the
+      // cached file is consumed. Replace it so reopening the task cannot
+      // import the same document again; future shares still use onNewIntent.
+      activity.intent = Intent(activity, activity.javaClass).apply {
+        action = Intent.ACTION_MAIN
+        addCategory(Intent.CATEGORY_LAUNCHER)
+      }
+    }
   }
 
   private fun installWebViewRedrawHooks(view: View): Int {
