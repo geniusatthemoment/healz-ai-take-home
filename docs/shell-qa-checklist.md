@@ -69,6 +69,18 @@ Expected:
 - The app shows the custom retry screen instead of a raw React Native warning.
 - `Retry` works after the network returns.
 
+## Share Target Chat Picker
+
+1. From Gallery or Files, share one PDF or image to Healz.
+2. Wait for the native chat picker to show the available Healz chats.
+3. Select an existing chat.
+
+Expected:
+- The selected chat opens in the WebView.
+- The file is attached to that chat, not to an arbitrary chat.
+
+Repeat with `New chat`, then test refresh and cancel.
+
 ## Record For Video
 
 Show these moments:

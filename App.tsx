@@ -9,6 +9,7 @@ import {
   NativeModules,
   Platform,
   Pressable,
+  ScrollView,
   StyleSheet,
   Text,
   View,
@@ -161,11 +162,351 @@ type SharedDocumentModule = {
 
 type WebShareMessage = {
   source: 'healz-share-target';
-  status: 'attached' | 'waiting' | 'error';
+  status: 'attached' | 'waiting' | 'error' | 'chats' | 'chat-selected';
   message: string;
+  chats?: ChatOption[];
+};
+
+type ChatOption = {
+  key: string;
+  title: string;
 };
 
 const sharedDocumentModule = NativeModules.SharedDocument as SharedDocumentModule | undefined;
+
+const REQUEST_CHAT_LIST_INJECTION = `
+  (function requestHealzChatList() {
+    var visible = function (element) {
+      var rect = element.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.top < window.innerHeight;
+    };
+    var cleanTitle = function (element) {
+      return (element.getAttribute('aria-label') || element.getAttribute('title') || element.textContent || '')
+        .replace(/\\s+/g, ' ')
+        .trim()
+        .slice(0, 80);
+    };
+    var isExcluded = function (title) {
+      return /new chat|new case|attach|upload|file|secure file vault|menu|language|settings|logout|sign out|try healz|pricing|privacy|terms|upgrade to plus|unlimited chats|anonymous|subscription|account|profile|@|^healz(?: ai)?(?: en)?$|^usen$|^(older|today|yesterday|previous)/i.test(title);
+    };
+    var isChatRow = function (element) {
+      var rect = element.getBoundingClientRect();
+      var inDrawer = !!element.closest('[role="dialog"], aside, [class*="sidebar" i], [data-sidebar]');
+      var hasRowAction = !!element.querySelector(':scope > button, :scope > [role="button"]');
+      var directTitles = Array.prototype.slice.call(element.children)
+        .map(cleanTitle)
+        .filter(Boolean);
+      return inDrawer && hasRowAction && directTitles.length === 1 &&
+        cleanTitle(element) === directTitles[0] && rect.height >= 36 && rect.height <= 160;
+    };
+    var scan = function () {
+      var candidates = Array.prototype.slice.call(document.querySelectorAll(
+        'aside a[href], aside button, aside [role="button"], aside [tabindex], ' +
+        'nav a[href], nav button, nav [role="button"], nav [tabindex], ' +
+        '[role="navigation"] a[href], [role="navigation"] button, ' +
+        '[role="navigation"] [role="button"], [role="navigation"] [tabindex], ' +
+        '[data-testid*="chat" i], [data-testid*="conversation" i], ' +
+        '[class*="chat-item" i], [class*="chat-list" i], [class*="conversation" i], ' +
+        '[class*="thread" i], ' +
+        '[role="dialog"] div, [role="dialog"] li, ' +
+        'a[href], button:not([disabled]), [role="button"], [tabindex]'
+      ));
+      var chats = [];
+      var seen = {};
+
+      candidates.forEach(function (candidate, index) {
+        var title = cleanTitle(candidate);
+        var href = candidate.href || candidate.getAttribute('href') || '';
+        var inSidebar = !!candidate.closest('aside, nav, [role="navigation"], [role="dialog"], [class*="sidebar" i], [data-sidebar]');
+        var looksLikeChatUrl = /\\/(chat|chats|conversation|conversations|case|cases|thread|threads)([/?#]|$)/i.test(href);
+        var looksLikeChatItem = /chat-item|conversation|chat-list|thread/i.test(candidate.getAttribute('class') || '') ||
+          /chat|conversation|thread/i.test(candidate.getAttribute('data-testid') || '') ||
+          isChatRow(candidate);
+        if (!visible(candidate) && !inSidebar && !looksLikeChatUrl && !looksLikeChatItem) return;
+        if (!title || isExcluded(title) || (!inSidebar && !looksLikeChatUrl && !looksLikeChatItem)) return;
+        if (href && (!/^https?:/i.test(href) || href.indexOf(location.origin) !== 0)) return;
+        if (href && /\\/(login|signup|settings|privacy|terms)([/?#]|$)/i.test(href)) return;
+
+        var key = href || 'dom-chat::' + title.toLowerCase();
+        if (seen[key]) return;
+        seen[key] = true;
+        candidate.setAttribute('data-healz-share-chat-key', key);
+        chats.push({ key: key, title: title });
+      });
+
+      window.ReactNativeWebView.postMessage(JSON.stringify({
+        source: 'healz-share-target',
+        status: 'chats',
+        message: 'Chat list is ready.',
+        chats: chats.slice(0, 30)
+      }));
+      return chats.length;
+    };
+
+    var findMenuButton = function () {
+      var controls = Array.prototype.slice.call(document.querySelectorAll(
+        'button:not([disabled]), [role="button"], [aria-label], [data-testid]'
+      ));
+      return controls.find(function (element) {
+        if (!visible(element) || element.closest('[role="dialog"]')) return false;
+        var text = [
+          element.getAttribute('aria-label'),
+          element.getAttribute('title'),
+          element.getAttribute('data-testid'),
+          element.getAttribute('class')
+        ].filter(Boolean).join(' ');
+        if (/menu|sidebar|navigation|open chats|hamburger/i.test(text)) return true;
+        var rect = element.getBoundingClientRect();
+        return !!element.querySelector('svg') && rect.width < 72 && rect.height < 72 && rect.left < 100;
+      });
+    };
+    var closeHiddenDrawer = function (drawer) {
+      var buttons = Array.prototype.slice.call(drawer.querySelectorAll('button'));
+      var close = buttons.find(function (button) {
+        var label = [button.getAttribute('aria-label'), button.getAttribute('title')].filter(Boolean).join(' ');
+        var rect = button.getBoundingClientRect();
+        return /close/i.test(label) || (rect.top < 140 && rect.right > window.innerWidth * 0.85);
+      });
+      if (close) close.click();
+    };
+    var scanHiddenDrawer = function () {
+      var menu = findMenuButton();
+      if (!menu) return;
+      var observer = new MutationObserver(function () {
+        var drawer = document.querySelector('[role="dialog"]');
+        if (!drawer) return;
+        drawer.style.visibility = 'hidden';
+        observer.disconnect();
+        setTimeout(function () {
+          scan();
+          closeHiddenDrawer(drawer);
+        }, 0);
+      });
+      observer.observe(document.documentElement, { childList: true, subtree: true });
+      menu.click();
+      setTimeout(function () { observer.disconnect(); }, 1500);
+    };
+
+    // Healz unmounts the mobile drawer when it closes, so its chat rows cannot
+    // be read directly. If the first scan is empty, mount the drawer hidden,
+    // read the rows, and close it before the WebView can paint it.
+    if (!scan()) scanHiddenDrawer();
+    setTimeout(function () {
+      if (!scan()) scanHiddenDrawer();
+    }, 350);
+  })();
+  true;
+`;
+
+function createSelectChatInjection(chatKey: string) {
+  return `
+    (function selectHealzChat() {
+      var key = ${JSON.stringify(chatKey)};
+      var cleanTitle = function (element) {
+        return (element.getAttribute('aria-label') || element.getAttribute('title') || element.textContent || '')
+          .replace(/\\s+/g, ' ')
+          .trim()
+          .slice(0, 80);
+      };
+      var tagChatRows = function () {
+        Array.prototype.slice.call(document.querySelectorAll('[role="dialog"] div, [role="dialog"] li'))
+          .forEach(function (element) {
+            var rect = element.getBoundingClientRect();
+            var hasRowAction = !!element.querySelector(':scope > button, :scope > [role="button"]');
+            var title = cleanTitle(element);
+            var directTitles = Array.prototype.slice.call(element.children)
+              .map(cleanTitle)
+              .filter(Boolean);
+            if (hasRowAction && directTitles.length === 1 && title === directTitles[0] &&
+                rect.height >= 36 && rect.height <= 160 && title) {
+              element.setAttribute('data-healz-share-chat-key', 'dom-chat::' + title.toLowerCase());
+            }
+          });
+      };
+      var findTarget = function () {
+        tagChatRows();
+        return Array.prototype.slice.call(
+          document.querySelectorAll('[data-healz-share-chat-key]')
+        ).find(function (element) {
+          return element.getAttribute('data-healz-share-chat-key') === key;
+        });
+      };
+      var target = findTarget();
+
+      if (!target) {
+        if (/^https?:/i.test(key) && key.indexOf(location.origin) === 0) {
+          location.href = key;
+          setTimeout(function () {
+            window.ReactNativeWebView.postMessage(JSON.stringify({
+              source: 'healz-share-target',
+              status: 'chat-selected',
+              message: 'The selected chat is opening.'
+            }));
+          }, 900);
+          return true;
+        }
+        var controls = Array.prototype.slice.call(document.querySelectorAll(
+          'button:not([disabled]), [role="button"], [aria-label], [data-testid]'
+        ));
+        var menu = controls.find(function (element) {
+          if (element.closest('[role="dialog"]')) return false;
+          var rect = element.getBoundingClientRect();
+          if (!(rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.top < window.innerHeight)) return false;
+          var text = [
+            element.getAttribute('aria-label'),
+            element.getAttribute('title'),
+            element.getAttribute('data-testid'),
+            element.getAttribute('class')
+          ].filter(Boolean).join(' ');
+          if (/menu|sidebar|navigation|open chats|hamburger/i.test(text)) return true;
+          return !!element.querySelector('svg') && rect.width < 72 && rect.height < 72 && rect.left < 100;
+        });
+        if (!menu) {
+          window.ReactNativeWebView.postMessage(JSON.stringify({
+            source: 'healz-share-target',
+            status: 'error',
+            message: 'The selected chat is no longer available.'
+          }));
+          return true;
+        }
+
+        var observer = new MutationObserver(function () {
+          var drawer = document.querySelector('[role="dialog"]');
+          if (!drawer) return;
+          drawer.style.visibility = 'hidden';
+          tagChatRows();
+          target = findTarget();
+          if (!target) return;
+          observer.disconnect();
+          target.click();
+          setTimeout(function () {
+            window.ReactNativeWebView.postMessage(JSON.stringify({
+              source: 'healz-share-target',
+              status: 'chat-selected',
+              message: 'The selected chat is opening.'
+            }));
+          }, 700);
+        });
+        observer.observe(document.documentElement, { childList: true, subtree: true });
+        menu.click();
+        setTimeout(function () {
+          observer.disconnect();
+          if (!target) {
+            window.ReactNativeWebView.postMessage(JSON.stringify({
+              source: 'healz-share-target',
+              status: 'error',
+              message: 'The selected chat could not be opened.'
+            }));
+          }
+        }, 1800);
+        return true;
+      }
+
+      target.click();
+      var startedAt = Date.now();
+      var confirmSelection = function () {
+        var currentTarget = Array.prototype.slice.call(
+          document.querySelectorAll('[data-healz-share-chat-key]')
+        ).find(function (element) {
+          return element.getAttribute('data-healz-share-chat-key') === key;
+        });
+        var classes = currentTarget && typeof currentTarget.className === 'string'
+          ? currentTarget.className
+          : '';
+        var selected = !currentTarget || location.href === key || (currentTarget && (
+          currentTarget.getAttribute('aria-current') === 'page' ||
+          currentTarget.getAttribute('data-state') === 'active' ||
+          /(^|\\s)(active|selected)(\\s|$)/i.test(classes)
+        ));
+
+        if (selected || Date.now() - startedAt >= 5000) {
+          window.ReactNativeWebView.postMessage(JSON.stringify({
+            source: 'healz-share-target',
+            status: selected ? 'chat-selected' : 'error',
+            message: selected
+              ? 'The selected chat is opening.'
+              : 'The selected chat did not finish opening.'
+          }));
+          return;
+        }
+        setTimeout(confirmSelection, 250);
+      };
+      setTimeout(confirmSelection, 250);
+    })();
+    true;
+  `;
+}
+
+const CREATE_NEW_CHAT_INJECTION = `
+  (function createHealzChat() {
+    var visible = function (element) {
+      var rect = element.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.top < window.innerHeight;
+    };
+    var findTarget = function () {
+      var controls = Array.prototype.slice.call(document.querySelectorAll(
+        'button:not([disabled]), a, [role="button"], [tabindex], [aria-label], [data-testid]'
+      ));
+      return controls.find(function (element) {
+        if (!visible(element)) return false;
+        var text = [
+          element.getAttribute('aria-label'),
+          element.getAttribute('title'),
+          element.getAttribute('data-testid'),
+          element.getAttribute('class'),
+          element.textContent
+        ].filter(Boolean).join(' ');
+        return /new chat|new case|start chat|new conversation|create chat|compose|add chat|plus/i.test(text);
+      });
+    };
+    var openSidebar = function () {
+      var controls = Array.prototype.slice.call(document.querySelectorAll(
+        'button:not([disabled]), [role="button"], [aria-label], [data-testid]'
+      ));
+      var menu = controls.find(function (element) {
+        if (!visible(element)) return false;
+        var text = [
+          element.getAttribute('aria-label'),
+          element.getAttribute('title'),
+          element.getAttribute('data-testid'),
+          element.getAttribute('class')
+        ].filter(Boolean).join(' ');
+        if (/menu|sidebar|navigation|open chats|hamburger/i.test(text)) return true;
+        return !!element.querySelector('svg') && element.getBoundingClientRect().width < 64;
+      });
+      if (menu) menu.click();
+    };
+    var tryCreate = function (attempt) {
+      var target = findTarget();
+      if (!target && attempt === 0) {
+        openSidebar();
+      }
+      if (!target && attempt < 12) {
+        setTimeout(function () { tryCreate(attempt + 1); }, 250);
+        return;
+      }
+      if (!target) {
+      window.ReactNativeWebView.postMessage(JSON.stringify({
+        source: 'healz-share-target',
+        status: 'error',
+        message: 'Could not find the New chat button in Healz.'
+      }));
+      return true;
+      }
+
+      target.click();
+      setTimeout(function () {
+        window.ReactNativeWebView.postMessage(JSON.stringify({
+          source: 'healz-share-target',
+          status: 'chat-selected',
+          message: 'A new chat is opening.'
+        }));
+      }, 900);
+    };
+    tryCreate(0);
+  })();
+  true;
+`;
 
 function isInternalUrl(url: string) {
   try {
@@ -294,6 +635,10 @@ function createAttachSharedDocumentInjection(batch: SharedDocumentBatch) {
         report('waiting', 'Waiting for the Healz chat to finish loading.');
         return true;
       }
+      if (window.__healzShareCompletedBatch === batchKey) {
+        report('attached', 'Shared file was already passed to Healz.');
+        return true;
+      }
       window.__healzShareActiveBatch = batchKey;
 
       var startedAt = Date.now();
@@ -303,6 +648,9 @@ function createAttachSharedDocumentInjection(batch: SharedDocumentBatch) {
       var finish = function (status, message) {
         if (completed) return;
         completed = true;
+        if (status === 'attached') {
+          window.__healzShareCompletedBatch = batchKey;
+        }
         window.__healzShareActiveBatch = null;
         window.__healzShareAttachRequested = false;
         report(status, message);
@@ -378,12 +726,17 @@ export default function App() {
   const shareReadAttemptRef = useRef(0);
   const shareRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const shareAttachStartedAtRef = useRef<number | null>(null);
+  const chatListRequestKeyRef = useRef<string | null>(null);
+  const attachRequestedRef = useRef(false);
   const [canGoBack, setCanGoBack] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [pendingSharedDocument, setPendingSharedDocument] = useState<SharedDocumentBatch | null>(null);
   const [isWebViewReady, setIsWebViewReady] = useState(false);
   const [shareStatus, setShareStatus] = useState<string | null>(null);
   const [shareRetryNonce, setShareRetryNonce] = useState(0);
+  const [chatOptions, setChatOptions] = useState<ChatOption[]>([]);
+  const [isChatPickerVisible, setIsChatPickerVisible] = useState(false);
+  const [isChatPickerLoading, setIsChatPickerLoading] = useState(false);
   const [webViewUrl, setWebViewUrl] = useState(APP_URL);
 
   const navigateToDeepLink = useCallback((url: string | null | undefined) => {
@@ -567,12 +920,13 @@ export default function App() {
         return;
       }
 
+      chatListRequestKeyRef.current = null;
+      attachRequestedRef.current = false;
+      setChatOptions([]);
+      setIsChatPickerLoading(true);
+      setIsChatPickerVisible(true);
       setPendingSharedDocument(batch);
-      const fileLabel = batch.count === 1 ? batch.documents[0].name : `${batch.count} documents`;
-      const status = batch.compressed
-        ? `Optimized ${fileLabel} for readability and upload speed...`
-        : `Preparing ${fileLabel} for Healz...`;
-      setShareStatus(status);
+      setShareStatus(null);
     } catch (error) {
       if (attempt !== shareReadAttemptRef.current || shareReadTimedOutRef.current) {
         return;
@@ -586,6 +940,63 @@ export default function App() {
         shareReadStartedAtRef.current = null;
       }
     }
+  }, []);
+
+  useEffect(() => {
+    if (!pendingSharedDocument || !isChatPickerVisible) {
+      return;
+    }
+
+    if (!isWebViewReady) {
+      setIsChatPickerLoading(true);
+      return;
+    }
+
+    const requestKey = pendingSharedDocument.documents
+      .map((document) => [document.uri, document.size].join('|'))
+      .join('||');
+    if (chatListRequestKeyRef.current === requestKey) {
+      return;
+    }
+
+    chatListRequestKeyRef.current = requestKey;
+    setIsChatPickerLoading(true);
+    webViewRef.current?.injectJavaScript(REQUEST_CHAT_LIST_INJECTION);
+  }, [isChatPickerVisible, isWebViewReady, pendingSharedDocument, shareRetryNonce]);
+
+  const handleCancelChatPicker = useCallback(() => {
+    setIsChatPickerVisible(false);
+    setIsChatPickerLoading(false);
+    setChatOptions([]);
+    setPendingSharedDocument(null);
+    setShareStatus(null);
+    shareAttachStartedAtRef.current = null;
+    chatListRequestKeyRef.current = null;
+    attachRequestedRef.current = false;
+    sharedDocumentModule?.clearPendingShare();
+  }, []);
+
+  const handleRetryChatList = useCallback(() => {
+    chatListRequestKeyRef.current = null;
+    setIsChatPickerLoading(true);
+    setShareRetryNonce((current) => current + 1);
+  }, []);
+
+  const handleSelectChat = useCallback((chat: ChatOption) => {
+    setIsChatPickerLoading(true);
+    setShareStatus(`Opening ${chat.title}...`);
+    webViewRef.current?.injectJavaScript(createSelectChatInjection(chat.key));
+  }, []);
+
+  const handleCreateNewChat = useCallback(() => {
+    setIsChatPickerVisible(false);
+    // Keep the original, proven flow for a new chat: the Healz page opens its
+    // own composer/file picker, and the existing attachment bridge waits for
+    // the file input to appear. The native picker only decides when to start
+    // that flow; it does not need to know Healz's private button selectors.
+    attachRequestedRef.current = true;
+    setShareStatus('Opening a new Healz chat...');
+    setShareRetryNonce((current) => current + 1);
   }, []);
 
   useEffect(() => {
@@ -614,7 +1025,7 @@ export default function App() {
   }, [checkPendingShare]);
 
   useEffect(() => {
-    if (!pendingSharedDocument) {
+    if (!pendingSharedDocument || !attachRequestedRef.current) {
       return;
     }
 
@@ -626,17 +1037,19 @@ export default function App() {
       shareAttachStartedAtRef.current = Date.now();
     }
     if (Date.now() - shareAttachStartedAtRef.current > SHARE_ATTACH_TIMEOUT_MS) {
+      setIsChatPickerVisible(false);
       setPendingSharedDocument(null);
       setShareStatus(null);
       shareAttachStartedAtRef.current = null;
+      attachRequestedRef.current = false;
       sharedDocumentModule?.clearPendingShare();
-      Alert.alert('Could not attach document', 'Open a Healz chat and share the file again.');
+      Alert.alert('Could not attach document', 'The chat took too long to open. Please share the file again.');
       return;
     }
 
-    // onLoadEnd reports document loading, whereas the Healz chat hydrates a
-    // little later. Keep the durable share pending and retry the bridge while
-    // that happens, rather than leaving a permanent "Preparing" state.
+    // onLoadEnd reports document loading, whereas the selected Healz chat
+    // hydrates a little later. Keep the durable share pending and retry the
+    // bridge while that happens, rather than losing the file.
     if (!isWebViewReady) {
       setShareStatus(`Opening Healz to attach ${fileLabel}...`);
       const retry = setTimeout(() => {
@@ -645,7 +1058,7 @@ export default function App() {
       return () => clearTimeout(retry);
     }
 
-    setShareStatus(`Attaching ${fileLabel} in Healz...`);
+    setShareStatus(`Attaching ${fileLabel} in this chat...`);
     webViewRef.current?.injectJavaScript(
       createAttachSharedDocumentInjection(pendingSharedDocument)
     );
@@ -669,6 +1082,28 @@ export default function App() {
           return;
         }
 
+        if (message.status === 'chats') {
+          setChatOptions(message.chats ?? []);
+          setIsChatPickerLoading(false);
+          return;
+        }
+
+        if (message.status === 'chat-selected') {
+          attachRequestedRef.current = true;
+          setIsChatPickerVisible(false);
+          setShareStatus('Preparing the file for this chat...');
+          setShareRetryNonce((current) => current + 1);
+          return;
+        }
+
+        if (message.status === 'error' && !attachRequestedRef.current) {
+          setIsChatPickerVisible(true);
+          setIsChatPickerLoading(false);
+          setShareStatus(null);
+          Alert.alert('Could not choose a chat', message.message);
+          return;
+        }
+
         if (message.status === 'waiting') {
           setShareStatus(message.message);
           if (!shareRetryTimerRef.current) {
@@ -687,9 +1122,11 @@ export default function App() {
           shareRetryTimerRef.current = null;
         }
 
+        setIsChatPickerVisible(false);
         setPendingSharedDocument(null);
         setShareStatus(null);
         shareAttachStartedAtRef.current = null;
+        attachRequestedRef.current = false;
         sharedDocumentModule?.clearPendingShare();
 
         if (message.status === 'error') {
@@ -768,6 +1205,66 @@ export default function App() {
               <Text style={styles.shareStatusText}>{shareStatus}</Text>
             </View>
           )}
+          {isChatPickerVisible && pendingSharedDocument && (
+            <View style={styles.chatPickerOverlay}>
+              <View style={styles.chatPickerCard}>
+                <Text style={styles.chatPickerEyebrow}>FILE READY</Text>
+                <Text style={styles.chatPickerTitle}>Where should we send it?</Text>
+                <Text style={styles.chatPickerDescription}>
+                  Choose a Healz chat for {pendingSharedDocument.count === 1
+                    ? pendingSharedDocument.documents[0].name
+                    : `${pendingSharedDocument.count} files`}.
+                </Text>
+
+                {isChatPickerLoading ? (
+                  <View style={styles.chatPickerLoading}>
+                    <ActivityIndicator size="small" color="#122033" />
+                    <Text style={styles.chatPickerLoadingText}>Loading your chats...</Text>
+                  </View>
+                ) : (
+                  <ScrollView
+                    style={styles.chatList}
+                    contentContainerStyle={styles.chatListContent}
+                    showsVerticalScrollIndicator={false}
+                  >
+                    {chatOptions.map((chat) => (
+                      <Pressable
+                        key={chat.key}
+                        style={styles.chatOption}
+                        onPress={() => handleSelectChat(chat)}
+                      >
+                        <View style={styles.chatOptionIcon}>
+                          <Text style={styles.chatOptionIconText}>↗</Text>
+                        </View>
+                        <Text style={styles.chatOptionText} numberOfLines={2}>
+                          {chat.title}
+                        </Text>
+                      </Pressable>
+                    ))}
+
+                    {chatOptions.length === 0 && (
+                      <Text style={styles.chatEmptyText}>
+                        No existing chats were found. You can start a new one.
+                      </Text>
+                    )}
+
+                    <Pressable style={styles.newChatButton} onPress={handleCreateNewChat}>
+                      <Text style={styles.newChatButtonText}>＋ New chat</Text>
+                    </Pressable>
+                  </ScrollView>
+                )}
+
+                {!isChatPickerLoading && (
+                  <Pressable style={styles.retryChatButton} onPress={handleRetryChatList}>
+                    <Text style={styles.retryChatButtonText}>Refresh chat list</Text>
+                  </Pressable>
+                )}
+                <Pressable style={styles.cancelChatButton} onPress={handleCancelChatPicker}>
+                  <Text style={styles.cancelChatButtonText}>Cancel</Text>
+                </Pressable>
+              </View>
+            </View>
+          )}
         </View>
       </SafeAreaView>
     </SafeAreaProvider>
@@ -810,6 +1307,131 @@ const styles = StyleSheet.create({
     color: '#ffffff',
     fontSize: 14,
     fontWeight: '700',
+  },
+  chatPickerOverlay: {
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
+    justifyContent: 'flex-end',
+    backgroundColor: 'rgba(18, 32, 51, 0.38)',
+  },
+  chatPickerCard: {
+    maxHeight: '82%',
+    borderTopLeftRadius: 28,
+    borderTopRightRadius: 28,
+    backgroundColor: '#ffffff',
+    paddingHorizontal: 20,
+    paddingTop: 24,
+    paddingBottom: 16,
+    shadowColor: '#122033',
+    shadowOffset: { width: 0, height: -6 },
+    shadowOpacity: 0.2,
+    shadowRadius: 18,
+    elevation: 14,
+  },
+  chatPickerEyebrow: {
+    color: '#8b6d78',
+    fontSize: 12,
+    fontWeight: '800',
+    letterSpacing: 1.2,
+  },
+  chatPickerTitle: {
+    marginTop: 6,
+    color: '#122033',
+    fontSize: 26,
+    fontWeight: '800',
+  },
+  chatPickerDescription: {
+    marginTop: 8,
+    color: '#5c6570',
+    fontSize: 14,
+    lineHeight: 20,
+  },
+  chatPickerLoading: {
+    minHeight: 150,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 10,
+  },
+  chatPickerLoadingText: {
+    color: '#5c6570',
+    fontSize: 14,
+  },
+  chatList: {
+    marginTop: 14,
+    maxHeight: 300,
+  },
+  chatListContent: {
+    gap: 8,
+    paddingBottom: 8,
+  },
+  chatOption: {
+    minHeight: 58,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    borderRadius: 16,
+    backgroundColor: '#f7f3f4',
+    paddingHorizontal: 12,
+    paddingVertical: 9,
+  },
+  chatOptionIcon: {
+    width: 34,
+    height: 34,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 17,
+    backgroundColor: '#2f2530',
+  },
+  chatOptionIconText: {
+    color: '#ffffff',
+    fontSize: 18,
+    fontWeight: '700',
+  },
+  chatOptionText: {
+    flex: 1,
+    color: '#2f2530',
+    fontSize: 15,
+    fontWeight: '700',
+  },
+  chatEmptyText: {
+    paddingVertical: 16,
+    color: '#5c6570',
+    fontSize: 14,
+    lineHeight: 20,
+    textAlign: 'center',
+  },
+  newChatButton: {
+    minHeight: 52,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 16,
+    backgroundColor: '#c5ff00',
+  },
+  newChatButtonText: {
+    color: '#122033',
+    fontSize: 16,
+    fontWeight: '800',
+  },
+  retryChatButton: {
+    alignItems: 'center',
+    paddingVertical: 10,
+  },
+  retryChatButtonText: {
+    color: '#6d5260',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  cancelChatButton: {
+    alignItems: 'center',
+    paddingVertical: 10,
+  },
+  cancelChatButtonText: {
+    color: '#8a8f96',
+    fontSize: 14,
+    fontWeight: '600',
   },
   loader: {
     flex: 1,

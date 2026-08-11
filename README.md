@@ -11,6 +11,7 @@ Android mobile shell for [app.healz.ai](https://app.healz.ai), built with Expo a
 - Healz icon, adaptive Android icon and branded splash screen.
 - Android Share target for PDF and image files from email, Gallery, Files and other apps.
 - Multiple-file sharing: up to 5 files per share, with a 20 MiB total original-size limit.
+- Chat picker after sharing: choose an existing Healz chat, start a new chat, refresh the list or cancel before the file is attached.
 - Retry screen for network errors and a visible status while a shared document is being prepared and attached to a Healz chat.
 
 ## Document preparation
@@ -28,7 +29,7 @@ This is intentionally conservative: medical text and numbers are more important 
 ## Requirements
 
 - Node.js 20+ recommended.
-- JDK 17 or 21 for a local Android release build.
+- JDK 17, 21 or 25 for a local Android release build. The build script prefers Homebrew JDK 21 and supports the JDK 25 bundled with Android Studio.
 - Android SDK with `ANDROID_HOME` configured.
 - Android device or emulator for testing.
 
@@ -63,7 +64,7 @@ The verification script checks the app configuration, branded assets, URL scheme
 npm run build:android:release
 ```
 
-The script uses JDK 17 or 21, runs Expo prebuild and assembles a release APK. The result is written to:
+The script selects a supported local JDK, runs Expo prebuild and assembles a release APK. The result is written to:
 
 ```text
 android/app/build/outputs/apk/release/app-release.apk
@@ -80,8 +81,10 @@ The manual smoke-test checklist is in [`docs/shell-qa-checklist.md`](docs/shell-
 3. Android back navigation.
 4. Opening an external link and returning to Healz.
 5. Sharing one PDF/image and multiple files from another app.
-6. A large image, a small image and a PDF.
-7. Offline/retry behavior.
+6. Selecting an existing chat or starting a new chat before the file is attached.
+7. Cancelling the chat picker and retrying the chat list.
+8. A large image, a small image and a PDF.
+9. Offline/retry behavior.
 
 ## Project structure
 
@@ -97,4 +100,4 @@ docs/shell-qa-checklist.md        Manual QA scenarios
 
 ## Scope and limitations
 
-This project wraps the public Healz website; it does not modify the Healz web product or implement a separate native chat UI. The current native document import path is Android-specific because the requested deliverable is a directly installable Android APK. The shared TypeScript/React Native shell remains suitable for an eventual iOS implementation, where the share extension would need a separate native integration.
+This project wraps the public Healz website and does not modify the Healz web product. It adds a small native chat-picker surface only for the Android share flow; chat contents and file upload remain in the WebView. The current native document import path is Android-specific because the requested deliverable is a directly installable Android APK. The shared TypeScript/React Native shell remains suitable for an eventual iOS implementation, where the share extension would need a separate native integration.
